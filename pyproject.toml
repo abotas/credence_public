@@ -1,0 +1,14 @@
+[project]
+name = "credence-public"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "altair>=6.0.0",
+    "pandas>=2.3.3",
+    "polars>=1.37.1",
+    "scipy>=1.17.0",
+    "streamlit>=1.53.0",
+    "watchdog>=6.0.0",
+]
