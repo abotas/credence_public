@@ -201,8 +201,8 @@ def render_prompt_attributes_tab(df: pl.DataFrame):
     st.subheader("Prompt Attributes")
 
     st.markdown(
-        "Each prompt is scored on 7 attributes by two judge models: **GPT-5 Mini** and **Claude Haiku 4.5**. "
-        "Judges agree when their scores are within **0.2** of each other (on a 0-1 scale)."
+        "Each prompt is scored on these attributes by two judges (GPT-5 Mini and Claude Haiku 4.5).  \n"
+        "Judge agreement is defined as |J1 - J2| <= 0.2 for these attributes which are scored [0, 1]."
     )
 
     if df.is_empty():
@@ -240,8 +240,6 @@ def render_prompt_attributes_tab(df: pl.DataFrame):
     # Consistent colors for attributes (same as correlations tab)
     colors = px.colors.qualitative.Plotly
     attr_colors = {attr_display[attr]: colors[i % len(colors)] for i, attr in enumerate(ATTRIBUTE_NAMES)}
-    # Also map with ⓘ suffix for bar chart
-    attr_colors_with_icon = {attr_display[attr] + " ⓘ": colors[i % len(colors)] for i, attr in enumerate(ATTRIBUTE_NAMES)}
 
     # Judge agreement rates per attribute - bar chart with labels
     agreement_data = []
@@ -256,7 +254,7 @@ def render_prompt_attributes_tab(df: pl.DataFrame):
                 )
                 agreement_rate = len(agreed) / len(valid)
                 agreement_data.append({
-                    "Attribute": attr_display[attr] + " ⓘ",
+                    "Attribute": attr_display[attr],
                     "Agreement Rate": agreement_rate,
                     "Label": f"{agreement_rate:.0%}",
                     "Tooltip": attr_tooltips[attr],
@@ -268,7 +266,7 @@ def render_prompt_attributes_tab(df: pl.DataFrame):
             agreement_df, x="Attribute", y="Agreement Rate",
             text="Label",
             color="Attribute",
-            color_discrete_map=attr_colors_with_icon,
+            color_discrete_map=attr_colors,
             hover_data={"Tooltip": True, "Agreement Rate": False, "Attribute": False, "Label": False},
         )
         bar_fig.update_layout(
