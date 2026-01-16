@@ -7,7 +7,9 @@ requires-python = ">=3.13"
 dependencies = [
     "altair>=6.0.0",
     "pandas>=2.3.3",
+    "plotly>=6.5.2",
     "polars>=1.37.1",
+    "scikit-learn>=1.8.0",
     "scipy>=1.17.0",
     "streamlit>=1.53.0",
     "watchdog>=6.0.0",

@@ -12,11 +12,12 @@ Part 1: Method Validation (V1-V4)
 
 from pathlib import Path
 
-import altair as alt
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
-from scipy.stats import spearmanr, wilcoxon
+from scipy.stats import pearsonr, spearmanr, wilcoxon
 
 # =============================================================================
 # Constants
@@ -137,19 +138,6 @@ def compute_test_retest_stats(_df: pl.DataFrame) -> pl.DataFrame:
 
 
 @st.cache_data
-def compute_progress_stats(_df: pl.DataFrame) -> pl.DataFrame:
-    """Compute progress stats per proposition per run."""
-    return _df.group_by(["proposition", "category", "run_id"]).agg([
-        pl.len().alias("total"),
-        pl.col("judge1_refusal").sum().alias("j1_refusal"),
-        pl.col("judge1_informative").sum().alias("j1_informative"),
-        pl.col("judge2_refusal").sum().alias("j2_refusal"),
-        pl.col("judge2_informative").sum().alias("j2_informative"),
-        pl.col("consensus_credence").is_not_null().sum().alias("consensus"),
-    ])
-
-
-@st.cache_data
 def compute_discriminant_stats(_df: pl.DataFrame, directions: dict[str, bool]) -> pl.DataFrame:
     """Compute per-proposition mean credence by model group."""
     # Get mean credence per proposition per model_group
@@ -201,8 +189,8 @@ def render_test_retest_tab():
         st.warning("No validation data found. Run build_parquet.py first.")
         return
 
-    # Exclusion toggle
-    exclude_bad = st.checkbox("Exclude propositions with >30% excluded samples", key="v1_exclude")
+    # Exclusion toggle (stored in state, displayed later)
+    exclude_bad = st.session_state.get("v1_exclude", False)
 
     # Category filter
     categories = ["All"] + list(CATEGORY_DISPLAY.keys())
@@ -238,37 +226,39 @@ def render_test_retest_tab():
     pdf = stats.to_pandas()
 
     # Compute metrics
-    r, _ = spearmanr(pdf["median_credence_0"], pdf["median_credence_1"])
+    spearman_r, _ = spearmanr(pdf["median_credence_0"], pdf["median_credence_1"])
+    pearson_r, _ = pearsonr(pdf["median_credence_0"], pdf["median_credence_1"])
     mad = (pdf["median_credence_0"] - pdf["median_credence_1"]).abs().mean()
 
-    col1, col2 = st.columns(2)
-    col1.metric("Spearman r", f"{r:.3f}")
-    col2.metric("Mean Abs Diff", f"{mad:.3f}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Pearson r", f"{pearson_r:.3f}")
+    col2.metric("Spearman r", f"{spearman_r:.3f}")
+    col3.metric("Mean Abs Diff", f"{mad:.3f}")
     st.caption(f"n={len(pdf)} propositions")
 
     # Scatter plot
     pdf["category_display"] = pdf["category"].map(CATEGORY_DISPLAY)
 
-    category_colors = alt.Scale(
-        domain=["Clearly False", "Uncertain", "Well-Established"],
-        range=["#e41a1c", "#984ea3", "#4daf4a"],
+    category_colors = {"Clearly False": "#e41a1c", "Uncertain": "#984ea3", "Well-Established": "#4daf4a"}
+
+    fig = px.scatter(
+        pdf, x="median_credence_0", y="median_credence_1",
+        color="category_display",
+        color_discrete_map=category_colors,
+        render_mode="webgl", opacity=0.5,
+        labels={"median_credence_0": "Run 0 Median", "median_credence_1": "Run 1 Median", "category_display": "Category"},
+        hover_data=["proposition"],
     )
+    fig.add_trace(go.Scatter(
+        x=[0, 1], y=[0, 1],
+        mode="lines", line=dict(color="gray", dash="dash", width=2), name="y=x",
+        showlegend=False,
+    ))
+    fig.update_traces(marker=dict(size=10), selector=dict(mode="markers"))
+    fig.update_layout(xaxis=dict(range=[0, 1]), yaxis=dict(range=[0, 1]), height=400)
+    st.plotly_chart(fig, use_container_width=True)
 
-    scatter = alt.Chart(pdf).mark_circle(size=100).encode(
-        x=alt.X("median_credence_0:Q", title="Run 0 Median", scale=alt.Scale(domain=[0, 1])),
-        y=alt.Y("median_credence_1:Q", title="Run 1 Median", scale=alt.Scale(domain=[0, 1])),
-        color=alt.Color("category_display:N", title="Category", scale=category_colors),
-        tooltip=["proposition:N", "category_display:N", "median_credence_0:Q", "median_credence_1:Q"],
-    )
-
-    diagonal = alt.Chart({"values": [{"x": 0, "y": 0}, {"x": 1, "y": 1}]}).mark_line(
-        strokeDash=[4, 4], color="gray"
-    ).encode(x="x:Q", y="y:Q")
-
-    st.altair_chart((diagonal + scatter).properties(height=400), use_container_width=True)
-
-    # Progress table
-    render_progress_table(df)
+    st.checkbox("Exclude propositions with >30% excluded samples", key="v1_exclude")
 
 
 def render_judge_agreement_tab():
@@ -280,8 +270,8 @@ def render_judge_agreement_tab():
         st.warning("No validation data found.")
         return
 
-    # Exclusion toggle
-    exclude_bad = st.checkbox("Exclude propositions with >30% excluded samples", key="v2_exclude")
+    # Exclusion toggle (stored in state, displayed later)
+    exclude_bad = st.session_state.get("v2_exclude", False)
 
     # Category filter
     categories = ["All"] + list(CATEGORY_DISPLAY.keys())
@@ -333,7 +323,7 @@ def render_judge_agreement_tab():
             "proposition", "judge1_credence", "judge2_credence",
             ((pl.col("judge1_credence") - pl.col("judge2_credence")).abs() <= AGREEMENT_THRESHOLD + eps).alias("agrees")
         ]).to_pandas()
-        opacity = 0.08
+        opacity = 0.05
 
     else:
         # Proposition-level (median)
@@ -357,34 +347,42 @@ def render_judge_agreement_tab():
         col2.metric("Agreed / Total", f"{n_agreed}/{total} propositions")
 
         plot_df = prop_agg.to_pandas()
-        opacity = 0.6
+        opacity = 0.4
 
     # Scatter plot
     if not plot_df.empty:
-        scatter = alt.Chart(plot_df).mark_circle(size=60, opacity=opacity).encode(
-            x=alt.X("judge1_credence:Q", title=judge1_name, scale=alt.Scale(domain=[0, 1])),
-            y=alt.Y("judge2_credence:Q", title=judge2_name, scale=alt.Scale(domain=[0, 1])),
-            color=alt.Color("agrees:N", scale=alt.Scale(domain=[True, False], range=["#4daf4a", "#e41a1c"])),
-            tooltip=["proposition:N", "judge1_credence:Q", "judge2_credence:Q"],
+        plot_df["agrees_str"] = plot_df["agrees"].map({True: "Agree", False: "Disagree"})
+        agree_colors = {"Agree": "#4daf4a", "Disagree": "#e41a1c"}
+
+        fig = px.scatter(
+            plot_df, x="judge1_credence", y="judge2_credence",
+            color="agrees_str",
+            color_discrete_map=agree_colors,
+            render_mode="webgl", opacity=opacity,
+            labels={"judge1_credence": judge1_name, "judge2_credence": judge2_name, "agrees_str": "Agreement"},
+            hover_data=["proposition"],
         )
-
-        diagonal = alt.Chart({"values": [{"x": 0, "y": 0}, {"x": 1, "y": 1}]}).mark_line(
-            strokeDash=[4, 4], color="gray"
-        ).encode(x="x:Q", y="y:Q")
-
-        st.altair_chart((diagonal + scatter).properties(height=400), use_container_width=True)
+        fig.add_trace(go.Scatter(
+            x=[0, 1], y=[0, 1],
+            mode="lines", line=dict(color="gray", dash="dash", width=2), name="y=x",
+            showlegend=False,
+        ))
+        fig.update_traces(marker=dict(size=10), selector=dict(mode="markers"))
+        fig.update_layout(xaxis=dict(range=[0, 1]), yaxis=dict(range=[0, 1]), height=400)
+        st.plotly_chart(fig, use_container_width=True)
 
         # Histogram
         plot_df["diff"] = plot_df["judge1_credence"] - plot_df["judge2_credence"]
-        hist = alt.Chart(plot_df).mark_bar(opacity=0.7).encode(
-            x=alt.X("diff:Q", bin=alt.Bin(maxbins=30), title="Judge 1 - Judge 2"),
-            y=alt.Y("count()", title="Count"),
-            color=alt.Color("agrees:N", scale=alt.Scale(domain=[True, False], range=["#4daf4a", "#e41a1c"]), legend=None),
-        ).properties(height=200)
+        hist_fig = px.histogram(
+            plot_df, x="diff", color="agrees_str",
+            color_discrete_map=agree_colors,
+            nbins=30, opacity=0.7,
+            labels={"diff": "Judge 1 - Judge 2", "agrees_str": "Agreement"},
+        )
+        hist_fig.update_layout(height=200, showlegend=False, bargap=0.1)
+        st.plotly_chart(hist_fig, use_container_width=True)
 
-        st.altair_chart(hist, use_container_width=True)
-
-    render_progress_table(df)
+    st.checkbox("Exclude propositions with >30% excluded samples", key="v2_exclude")
 
 
 def render_calibration_tab():
@@ -396,8 +394,8 @@ def render_calibration_tab():
         st.warning("No validation data found.")
         return
 
-    # Exclusion toggle
-    exclude_bad = st.checkbox("Exclude propositions with >30% excluded samples", key="v3_exclude")
+    # Exclusion toggle (stored in state, displayed later)
+    exclude_bad = st.session_state.get("v3_exclude", False)
 
     # Aggregation level
     agg_level = st.radio(
@@ -422,8 +420,9 @@ def render_calibration_tab():
         cf_in = (cf <= CLEARLY_FALSE_MAX + eps).sum()
         we_in = (we >= WELL_ESTABLISHED_MIN - eps).sum()
 
-        cf_pct = f"{cf_in/cf.len():.1%}" if cf.len() > 0 else "N/A"
-        we_pct = f"{we_in/we.len():.1%}" if we.len() > 0 else "N/A"
+        col1, col2 = st.columns(2)
+        col1.metric("Clearly False <= 0.1", f"{cf_in/cf.len():.1%}" if cf.len() > 0 else "N/A", help=f"{cf_in}/{cf.len()}")
+        col2.metric("Well-Established >= 0.9", f"{we_in/we.len():.1%}" if we.len() > 0 else "N/A", help=f"{we_in}/{we.len()}")
 
         # Build box plot data
         box_df = filtered.select(["category", "consensus_credence", "proposition"]).drop_nulls().to_pandas()
@@ -440,8 +439,9 @@ def render_calibration_tab():
         cf_in = (cf <= CLEARLY_FALSE_MAX + eps).sum()
         we_in = (we >= WELL_ESTABLISHED_MIN - eps).sum()
 
-        cf_pct = f"{cf_in/cf.len():.1%}" if cf.len() > 0 else "N/A"
-        we_pct = f"{we_in/we.len():.1%}" if we.len() > 0 else "N/A"
+        col1, col2 = st.columns(2)
+        col1.metric("Clearly False <= 0.1", f"{cf_in/cf.len():.1%}" if cf.len() > 0 else "N/A", help=f"{cf_in}/{cf.len()}")
+        col2.metric("Well-Established >= 0.9", f"{we_in/we.len():.1%}" if we.len() > 0 else "N/A", help=f"{we_in}/{we.len()}")
 
         # Build box plot from medians
         box_df = prop_medians.select([
@@ -454,42 +454,27 @@ def render_calibration_tab():
     if not box_df.empty:
         box_df["category_display"] = box_df["category"].map(CATEGORY_DISPLAY)
         category_order = ["Clearly False", "Uncertain", "Well-Established"]
-        category_colors = alt.Scale(
-            domain=["Clearly False", "Uncertain", "Well-Established"],
-            range=["#e41a1c", "#984ea3", "#4daf4a"],
-        )
+        category_colors = {"Clearly False": "#e41a1c", "Uncertain": "#984ea3", "Well-Established": "#4daf4a"}
 
-        boxplot = alt.Chart(box_df).mark_boxplot(size=60).encode(
-            x=alt.X("category_display:N", title=None, sort=category_order, axis=alt.Axis(labelAngle=0)),
-            y=alt.Y("consensus_credence:Q", title="Credence", scale=alt.Scale(domain=[0, 1.15])),
-            color=alt.Color("category_display:N", legend=None, scale=category_colors),
+        fig = px.box(
+            box_df, x="category_display", y="consensus_credence",
+            color="category_display",
+            color_discrete_map=category_colors,
+            category_orders={"category_display": category_order},
+            points="all",
+            labels={"category_display": "", "consensus_credence": "Credence"},
+            hover_data=["proposition"],
         )
-
-        points = alt.Chart(box_df).mark_circle(size=40, opacity=0.15).encode(
-            x=alt.X("category_display:N", sort=category_order),
-            y="consensus_credence:Q",
-            color=alt.Color("category_display:N", legend=None, scale=category_colors),
-            tooltip=["proposition:N", "consensus_credence:Q"],
-        )
+        fig.update_traces(marker=dict(opacity=0.15, size=6), pointpos=0)
 
         # Expected range bands
-        cf_band = alt.Chart(pd.DataFrame({"y": [0], "y2": [0.1]})).mark_rect(opacity=0.2, color="green").encode(y="y:Q", y2="y2:Q")
-        we_band = alt.Chart(pd.DataFrame({"y": [0.9], "y2": [1.0]})).mark_rect(opacity=0.2, color="green").encode(y="y:Q", y2="y2:Q")
+        fig.add_hrect(y0=0, y1=0.1, fillcolor="green", opacity=0.15, line_width=0)
+        fig.add_hrect(y0=0.9, y1=1.0, fillcolor="green", opacity=0.15, line_width=0)
 
-        # Text annotations above each category
-        annotations_df = pd.DataFrame([
-            {"category_display": "Clearly False", "y": 1.08, "label": f"≤0.1: {cf_pct}"},
-            {"category_display": "Well-Established", "y": 1.08, "label": f"≥0.9: {we_pct}"},
-        ])
-        annotations = alt.Chart(annotations_df).mark_text(fontSize=14, fontWeight="bold").encode(
-            x=alt.X("category_display:N", sort=category_order),
-            y=alt.Y("y:Q"),
-            text="label:N",
-        )
+        fig.update_layout(yaxis=dict(range=[0, 1]), height=300, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
 
-        st.altair_chart((cf_band + we_band + boxplot + points + annotations).properties(height=350), use_container_width=True)
-
-    render_progress_table(df)
+    st.checkbox("Exclude propositions with >30% excluded samples", key="v3_exclude")
 
 
 def render_known_group_tab():
@@ -506,8 +491,8 @@ def render_known_group_tab():
         st.warning("No proposition directions found.")
         return
 
-    # Exclusion toggle
-    exclude_bad = st.checkbox("Exclude propositions with >30% excluded samples", key="v4_exclude")
+    # Exclusion toggle (stored in state, displayed later)
+    exclude_bad = st.session_state.get("v4_exclude", False)
 
     # Filter data
     filtered = df
@@ -548,8 +533,6 @@ def render_known_group_tab():
             "correct": correct,
         })
 
-    results_df = pl.DataFrame(results)
-
     # Compute test statistics
     valid_shifts = [r["signed_shift"] for r in results if r["signed_shift"] is not None]
     valid_results = [r for r in results if r["correct"] is not None]
@@ -560,61 +543,74 @@ def render_known_group_tab():
     nonzero = [s for s in valid_shifts if s != 0]
     p_value = wilcoxon(nonzero, alternative="greater")[1] if len(nonzero) >= 5 else None
 
+    # Dumbbell chart
+    plot_results = [r for r in results if r["western"] is not None and r["chinese"] is not None]
+    if plot_results:
+        # Sort by signed shift ascending (so biggest green appears at top of chart, biggest red at bottom)
+        plot_results = sorted(plot_results, key=lambda r: r["signed_shift"] or 0)
+
+        fig = go.Figure()
+
+        for r in plot_results:
+            color = "#4daf4a" if r["correct"] else "#e41a1c"
+            prop_short = r["proposition"][:40] + "..." if len(r["proposition"]) > 40 else r["proposition"]
+            prop_full = r["proposition"]
+            shift_val = r["shift"]
+
+            # Line connecting Western to Chinese
+            fig.add_trace(go.Scatter(
+                x=[r["western"], r["chinese"]],
+                y=[prop_short, prop_short],
+                mode="lines",
+                line=dict(color=color, width=2),
+                showlegend=False,
+                hoverinfo="skip",
+            ))
+
+            # Western dot (circle)
+            fig.add_trace(go.Scatter(
+                x=[r["western"]],
+                y=[prop_short],
+                mode="markers",
+                marker=dict(color=color, size=10, symbol="circle"),
+                name="Western",
+                showlegend=False,
+                hovertemplate=f"<b>{prop_full}</b><br>Western: {r['western']:.3f}<br>Shift: {shift_val:+.3f}<extra></extra>",
+            ))
+
+            # Chinese dot (diamond)
+            fig.add_trace(go.Scatter(
+                x=[r["chinese"]],
+                y=[prop_short],
+                mode="markers",
+                marker=dict(color=color, size=10, symbol="diamond"),
+                name="Chinese",
+                showlegend=False,
+                hovertemplate=f"<b>{prop_full}</b><br>Chinese: {r['chinese']:.3f}<br>Shift: {shift_val:+.3f}<extra></extra>",
+            ))
+
+        # Add legend entries
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="#4daf4a", size=10), name="Predicted"))
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="#e41a1c", size=10), name="Unexpected"))
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="gray", size=10, symbol="circle"), name="Western"))
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", marker=dict(color="gray", size=10, symbol="diamond"), name="Chinese"))
+
+        fig.update_layout(
+            height=max(300, 25 * len(plot_results)),
+            xaxis=dict(title="Credence", range=[0, 1]),
+            yaxis=dict(title=""),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            margin=dict(l=10),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Metrics and exclusion toggle (below figure)
     col1, col2, col3 = st.columns(3)
     col1.metric("Mean Signed Shift", f"{mean_shift:+.3f}" if mean_shift else "N/A")
     col2.metric("Wilcoxon p-value", f"{p_value:.4f}" if p_value else "N/A")
     col3.metric("Directional Accuracy", f"{n_correct/n_total:.1%}" if n_total > 0 else "N/A", help=f"{n_correct}/{n_total}")
 
-    # Per-proposition table
-    st.subheader("Per-Proposition Results")
-    display_df = results_df.with_columns([
-        pl.col("proposition").str.slice(0, 50).alias("Proposition"),
-        pl.when(pl.col("direction")).then(pl.lit("Higher")).otherwise(pl.lit("Lower")).alias("Expected"),
-        pl.col("western").round(3).cast(pl.Utf8).fill_null("-").alias("Western"),
-        pl.col("chinese").round(3).cast(pl.Utf8).fill_null("-").alias("Chinese"),
-        pl.col("shift").round(3).cast(pl.Utf8).fill_null("-").alias("Shift"),
-        pl.when(pl.col("correct")).then(pl.lit("Yes")).when(pl.col("correct") == False).then(pl.lit("No")).otherwise(pl.lit("-")).alias("Correct"),
-    ]).select(["Proposition", "Expected", "Western", "Chinese", "Shift", "Correct"])
-
-    st.dataframe(display_df.to_pandas(), use_container_width=True, hide_index=True)
-
-
-@st.cache_data
-def _compute_progress_summary(_df: pl.DataFrame) -> list[dict]:
-    """Compute progress summary rows (cached)."""
-    progress = compute_progress_stats(_df)
-
-    # Aggregate by run
-    run_stats = progress.group_by("run_id").agg([
-        pl.col("total").sum().alias("total"),
-        pl.col("j1_refusal").sum().alias("j1_refusal"),
-        pl.col("j1_informative").sum().alias("j1_informative"),
-        pl.col("j2_refusal").sum().alias("j2_refusal"),
-        pl.col("j2_informative").sum().alias("j2_informative"),
-        pl.col("consensus").sum().alias("consensus"),
-        pl.len().alias("n_props"),
-    ]).sort("run_id")
-
-    rows = []
-    for row in run_stats.iter_rows(named=True):
-        j1_uninf = row["total"] - row["j1_informative"] - row["j1_refusal"]
-        j2_uninf = row["total"] - row["j2_informative"] - row["j2_refusal"]
-        rows.append({
-            "Run": f"Run {row['run_id']}",
-            "Samples": row["total"],
-            "J1 Ref/Uninf/Inf": f"{row['j1_refusal']}/{j1_uninf}/{row['j1_informative']}",
-            "J2 Ref/Uninf/Inf": f"{row['j2_refusal']}/{j2_uninf}/{row['j2_informative']}",
-            "Consensus": row["consensus"],
-        })
-    return rows
-
-
-def render_progress_table(df: pl.DataFrame):
-    """Render progress summary table."""
-    st.markdown("---")
-    with st.expander("Progress", expanded=False):
-        rows = _compute_progress_summary(df)
-        st.dataframe(pl.DataFrame(rows).to_pandas(), use_container_width=True, hide_index=True)
+    st.checkbox("Exclude propositions with >30% excluded samples", key="v4_exclude")
 
 
 # =============================================================================
