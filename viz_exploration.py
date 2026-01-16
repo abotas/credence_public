@@ -200,6 +200,11 @@ def render_prompt_attributes_tab(df: pl.DataFrame):
     """Render prompt attributes analysis tab."""
     st.subheader("Prompt Attributes")
 
+    st.markdown(
+        "Each prompt is scored on 7 attributes by two judge models: **GPT-5 Mini** and **Claude Haiku 4.5**. "
+        "Judges agree when their scores are within **0.2** of each other (on a 0-1 scale)."
+    )
+
     if df.is_empty():
         st.warning("No data found.")
         return
@@ -210,70 +215,118 @@ def render_prompt_attributes_tab(df: pl.DataFrame):
         st.warning("Prompt attributes not yet scored. Run run_exploration.py first.")
         return
 
-    # Domain filter
-    domains = ["All"] + sorted(df["domain"].unique().to_list()) if "domain" in df.columns else ["All"]
-    selected_domain = st.selectbox("Domain", domains, key="attr_domain")
+    # Display names for attributes
+    attr_display = {
+        "user_valence": "user valence",
+        "sophistication": "sophistication",
+        "apparent_stakes": "stakes",
+        "emotionality": "emotionality",
+        "user_authority": "authority",
+        "confrontationality": "confrontationality",
+        "clarity": "clarity",
+    }
 
-    filtered = df
-    if selected_domain != "All":
-        filtered = filtered.filter(pl.col("domain") == selected_domain)
+    # Tooltips for attributes
+    attr_tooltips = {
+        "user_valence": "Implied user prior belief (skeptical to credulous)",
+        "sophistication": "Apparent education level and writing quality",
+        "apparent_stakes": "How consequential the decision/situation is",
+        "emotionality": "How emotionally charged the prompt is",
+        "user_authority": "How much expertise/confidence user projects",
+        "confrontationality": "Cooperative vs adversarial stance toward AI",
+        "clarity": "How specific and unambiguous the request is",
+    }
 
-    # Judge agreement rates per attribute
-    st.subheader("Prompt Judge Agreement Rates")
+    # Consistent colors for attributes (same as correlations tab)
+    colors = px.colors.qualitative.Plotly
+    attr_colors = {attr_display[attr]: colors[i % len(colors)] for i, attr in enumerate(ATTRIBUTE_NAMES)}
+    # Also map with ⓘ suffix for bar chart
+    attr_colors_with_icon = {attr_display[attr] + " ⓘ": colors[i % len(colors)] for i, attr in enumerate(ATTRIBUTE_NAMES)}
+
+    # Judge agreement rates per attribute - bar chart with labels
     agreement_data = []
     for attr in ATTRIBUTE_NAMES:
         j1_col = f"prompt_judge1_{attr}"
         j2_col = f"prompt_judge2_{attr}"
-        if j1_col in filtered.columns and j2_col in filtered.columns:
-            valid = filtered.filter(pl.col(j1_col).is_not_null() & pl.col(j2_col).is_not_null())
+        if j1_col in df.columns and j2_col in df.columns:
+            valid = df.filter(pl.col(j1_col).is_not_null() & pl.col(j2_col).is_not_null())
             if len(valid) > 0:
                 agreed = valid.filter(
                     (pl.col(j1_col) - pl.col(j2_col)).abs() <= CONSENSUS_THRESHOLD + 1e-9
                 )
                 agreement_rate = len(agreed) / len(valid)
                 agreement_data.append({
-                    "Attribute": attr,
-                    "Agreement Rate": f"{agreement_rate:.1%}",
-                    "Agreed": len(agreed),
-                    "Total": len(valid),
+                    "Attribute": attr_display[attr] + " ⓘ",
+                    "Agreement Rate": agreement_rate,
+                    "Label": f"{agreement_rate:.0%}",
+                    "Tooltip": attr_tooltips[attr],
                 })
 
     if agreement_data:
-        st.dataframe(pd.DataFrame(agreement_data), use_container_width=True, hide_index=True)
+        agreement_df = pd.DataFrame(agreement_data).sort_values("Agreement Rate", ascending=False)
+        bar_fig = px.bar(
+            agreement_df, x="Attribute", y="Agreement Rate",
+            text="Label",
+            color="Attribute",
+            color_discrete_map=attr_colors_with_icon,
+            hover_data={"Tooltip": True, "Agreement Rate": False, "Attribute": False, "Label": False},
+        )
+        bar_fig.update_layout(
+            height=280,
+            yaxis=dict(range=[0, 1.12], tickformat=".0%"),
+            title="Prompt Judge Agreement Rate by Attribute",
+            showlegend=False,
+        )
+        bar_fig.update_traces(textposition="outside", hovertemplate="%{customdata[0]}<extra></extra>")
+        st.plotly_chart(bar_fig, use_container_width=True)
 
-    # Distribution histograms
-    st.subheader("Attribute Distributions (Consensus Values)")
+    # Attribute distribution histograms - 4 on top, 3 centered below
+    st.markdown("**Attribute Distributions (Consensus Values)**")
+    row1_cols = st.columns(4)
+    # Center 3 columns beneath 4: use spacers on sides (0.5 : 1 : 1 : 1 : 0.5)
+    row2_spacer_left, row2_c1, row2_c2, row2_c3, row2_spacer_right = st.columns([0.5, 1, 1, 1, 0.5])
+    row2_cols = [row2_c1, row2_c2, row2_c3]
+    all_cols = row1_cols + row2_cols
 
-    attr_select = st.selectbox("Select Attribute", ATTRIBUTE_NAMES, key="attr_dist")
-    consensus_col = f"consensus_{attr_select}"
+    for i, attr in enumerate(ATTRIBUTE_NAMES):
+        consensus_col = f"consensus_{attr}"
+        display_name = attr_display[attr]
 
-    if consensus_col in filtered.columns:
-        total_samples = len(filtered)
-        values = filtered[consensus_col].drop_nulls().to_pandas()
-        consensus_rate = len(values) / total_samples if total_samples > 0 else 0
+        if consensus_col in df.columns:
+            values = df[consensus_col].drop_nulls().to_pandas()
 
-        if not values.empty:
-            col1, col2, col3, col4, col5 = st.columns(5)
-            col1.metric("Consensus", f"{len(values):,} / {total_samples:,}", f"{consensus_rate:.1%}")
-            col2.metric("Mean", f"{values.mean():.3f}")
-            col3.metric("Median", f"{values.median():.3f}")
-            col4.metric("Std", f"{values.std():.3f}")
-            col5.metric("Range", f"{values.min():.2f} - {values.max():.2f}")
-
-            hist_df = pd.DataFrame({"value": values})
-            hist_fig = px.histogram(
-                hist_df, x="value",
-                nbins=10, opacity=0.7,
-                labels={"value": attr_select},
-                range_x=[0, 1],
-            )
-            hist_fig.update_layout(height=250, bargap=0.1, yaxis_title="Count")
-            st.plotly_chart(hist_fig, use_container_width=True)
+            if not values.empty:
+                hist_df = pd.DataFrame({"value": values})
+                hist_fig = px.histogram(
+                    hist_df, x="value",
+                    opacity=0.7,
+                    range_x=[0, 1],
+                )
+                hist_fig.update_traces(
+                    xbins=dict(start=0, end=1, size=0.05),
+                    marker_color=attr_colors[display_name],
+                )
+                hist_fig.update_layout(
+                    height=180,
+                    bargap=0.1,
+                    title=display_name,
+                    title_font_size=12,
+                    margin=dict(l=30, r=10, t=30, b=30),
+                    xaxis_title="",
+                    yaxis_title="",
+                )
+                with all_cols[i]:
+                    st.plotly_chart(hist_fig, use_container_width=True)
 
 
 def render_correlations_tab(df: pl.DataFrame):
     """Render attribute-credence correlations tab."""
-    st.subheader("Attribute-Credence Correlations")
+    st.markdown("**How does expressed credence from the test model vary with prompt attributes?**")
+
+    # Smaller table text
+    st.markdown("""<style>
+        [data-testid="stDataFrame"] { font-size: 0.85rem; }
+    </style>""", unsafe_allow_html=True)
 
     if df.is_empty():
         st.warning("No data found.")
@@ -285,34 +338,20 @@ def render_correlations_tab(df: pl.DataFrame):
         st.warning("Prompt attributes not yet scored. Run run_exploration.py first.")
         return
 
-    # Display mode toggle
-    display_mode = st.radio("Show values as:", ["Spearman Corr", "R²"], horizontal=True, key="corr_display_mode")
-    show_r2 = display_mode == "R²"
-
-    # Filters
+    # Get filter options
     all_domains = sorted(df["domain"].unique().to_list()) if "domain" in df.columns else []
     all_models = sorted(df["target_model_id"].unique().to_list())
     all_model_names = [_friendly_model_name(m) for m in all_models]
-
-    col1, col2 = st.columns(2)
-    with col1:
-        selected_domains = st.multiselect(
-            "Domains",
-            all_domains,
-            default=all_domains,
-            key="corr_domains"
-        )
-    with col2:
-        selected_model_names = st.multiselect(
-            "Test Models",
-            all_model_names,
-            default=all_model_names,
-            key="corr_models"
-        )
-    # Map friendly names back to model IDs
     name_to_id = {_friendly_model_name(m): m for m in all_models}
-    selected_models = [name_to_id[name] for name in selected_model_names]
 
+    # Read filter values from session_state (displayed above table)
+    display_mode = st.session_state.get("corr_display_mode", "Spearman Correlation")
+    show_r2 = display_mode == "R²"
+    selected_domains = st.session_state.get("corr_domains", all_domains)
+    selected_model_names = st.session_state.get("corr_models", all_model_names)
+    selected_models = [name_to_id[name] for name in selected_model_names if name in name_to_id]
+
+    # Apply filters
     filtered = df
     if selected_domains:
         filtered = filtered.filter(pl.col("domain").is_in(selected_domains))
@@ -320,6 +359,26 @@ def render_correlations_tab(df: pl.DataFrame):
         filtered = filtered.filter(pl.col("target_model_id").is_in(selected_models))
 
     attrs_to_show = list(ATTRIBUTE_NAMES)
+
+    # Display names and tooltips for attributes
+    attr_display = {
+        "user_valence": "user valence",
+        "sophistication": "sophistication",
+        "apparent_stakes": "stakes",
+        "emotionality": "emotionality",
+        "user_authority": "authority",
+        "confrontationality": "confrontationality",
+        "clarity": "clarity",
+    }
+    attr_tooltips = {
+        "user_valence": "Implied user prior belief (skeptical to credulous) in the prompt",
+        "sophistication": "Apparent education level and writing quality from the prompt",
+        "apparent_stakes": "How consequential the decision/situation is from the prompt",
+        "emotionality": "How emotionally charged the prompt is",
+        "user_authority": "How much expertise/confidence user projects in the prompt",
+        "confrontationality": "Cooperative vs adversarial stance from the user in the prompt",
+        "clarity": "How specific and unambiguous the request is in the prompt",
+    }
 
     def sig_stars(p: float, threshold: float = 0.05) -> str:
         """Return significance stars based on p-value."""
@@ -345,11 +404,6 @@ def render_correlations_tab(df: pl.DataFrame):
             min_so_far = min(min_so_far, adjusted_p)
             adjusted[orig_idx] = min_so_far
         return adjusted
-
-    # =========================================================================
-    # BY MODEL: How does each model respond to the selected attributes?
-    # =========================================================================
-    st.subheader("Credence - Prompt Attribute Correlation by Test Model")
 
     sensitivity_col = "Overall Sensitivity (R²)"
 
@@ -430,9 +484,34 @@ def render_correlations_tab(df: pl.DataFrame):
 
             model_corr_df = pd.DataFrame(model_corr_rows)
             model_corr_df = model_corr_df[["Test Model"] + sorted_attrs + [sensitivity_col]]
-            st.dataframe(model_corr_df, use_container_width=True, hide_index=True)
-            st.caption("\\* q<0.05, \\*\\* q<0.01, \\*\\*\\* q<0.001 (FDR-corrected)")
-            st.caption("Overall Sensitivity: R² from regressing credence on all prompt attributes (variance explained).")
+
+            # Rename columns to display names
+            rename_map = {attr: attr_display[attr] for attr in sorted_attrs}
+            model_corr_df = model_corr_df.rename(columns=rename_map)
+
+            # Build column config with tooltips (add ⓘ to hint hover)
+            col_config = {
+                "Test Model": st.column_config.TextColumn("Test Model", help="Model under test"),
+                sensitivity_col: st.column_config.TextColumn(sensitivity_col + " ⓘ", help="R² from regressing credence on all prompt attributes"),
+            }
+            for attr in sorted_attrs:
+                display_name = attr_display[attr]
+                col_config[display_name] = st.column_config.TextColumn(display_name + " ⓘ", help=attr_tooltips[attr])
+
+            # Controls row: display mode toggle + filters
+            ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 1.5, 1.5])
+            with ctrl_col1:
+                st.radio("Display mode", ["Spearman Correlation", "R²"], horizontal=True, key="corr_display_mode", label_visibility="collapsed")
+            with ctrl_col2:
+                with st.expander("Domains", expanded=False):
+                    st.multiselect("Select domains", all_domains, default=all_domains, key="corr_domains", label_visibility="collapsed")
+            with ctrl_col3:
+                with st.expander("Test Models", expanded=False):
+                    st.multiselect("Select models", all_model_names, default=all_model_names, key="corr_models", label_visibility="collapsed")
+
+            # Table
+            st.dataframe(model_corr_df, use_container_width=True, hide_index=True, column_config=col_config)
+            st.caption("\\* q<0.05, \\*\\* q<0.01, \\*\\*\\* q<0.001 (FDR-corrected). Overall Sensitivity: variance explained by all prompt attributes.")
 
     # Coefficient plot: dots showing r or r² values per model, colored by attribute
     if attrs_to_show and selected_models and model_corr_rows:
@@ -444,7 +523,7 @@ def render_correlations_tab(df: pl.DataFrame):
                     corr = entry["correlations"][attr]
                     coef_data.append({
                         "Model": model_name,
-                        "Attribute": attr,
+                        "Attribute": attr_display[attr],
                         "value": corr["r"]**2 if show_r2 else corr["r"],
                         "significant": corr["q"] < 0.05,
                     })
@@ -452,19 +531,58 @@ def render_correlations_tab(df: pl.DataFrame):
         if coef_data:
             coef_df = pd.DataFrame(coef_data)
             x_label = "r²" if show_r2 else "Spearman r"
-            x_range = [0, 0.5] if show_r2 else [-0.5, 0.5]
-            fig = px.scatter(
-                coef_df, x="value", y="Model",
-                color="Attribute",
-                symbol="significant",
-                symbol_map={True: "circle", False: "circle-open"},
-                labels={"value": x_label, "significant": "q < 0.05", "Model": "Test Model"},
-            )
+            # Compute dynamic range based on actual data
+            min_val = coef_df["value"].min()
+            max_val = coef_df["value"].max()
+            padding = (max_val - min_val) * 0.1 if max_val > min_val else 0.1
+            if show_r2:
+                x_range = [0, max(0.5, max_val + padding)]
+            else:
+                x_range = [min(-0.5, min_val - padding), max(0.5, max_val + padding)]
+            # Build plot manually for cleaner legend
+            fig = go.Figure()
+            colors = px.colors.qualitative.Plotly
+            attr_colors = {attr_display[attr]: colors[i % len(colors)] for i, attr in enumerate(sorted_attrs)}
+
+            for attr in sorted_attrs:
+                attr_name = attr_display[attr]
+                color = attr_colors[attr_name]
+                attr_data = coef_df[coef_df["Attribute"] == attr_name]
+
+                # Significant (filled)
+                sig_data = attr_data[attr_data["significant"]]
+                if not sig_data.empty:
+                    fig.add_trace(go.Scatter(
+                        x=sig_data["value"], y=sig_data["Model"],
+                        mode="markers",
+                        marker=dict(size=10, color=color, symbol="circle"),
+                        name=attr_name,
+                        legendgroup=attr_name,
+                        showlegend=True,
+                    ))
+
+                # Not significant (open)
+                nonsig_data = attr_data[~attr_data["significant"]]
+                if not nonsig_data.empty:
+                    fig.add_trace(go.Scatter(
+                        x=nonsig_data["value"], y=nonsig_data["Model"],
+                        mode="markers",
+                        marker=dict(size=10, color=color, symbol="circle-open", line=dict(width=2, color=color)),
+                        name=attr_name,
+                        legendgroup=attr_name,
+                        showlegend=sig_data.empty,  # Only show in legend if no filled version
+                    ))
+
             if not show_r2:
                 fig.add_vline(x=0, line_dash="dash", line_color="gray")
-            fig.update_layout(height=250 + 30 * len(selected_models), xaxis=dict(range=x_range))
-            fig.update_traces(marker=dict(size=10))
+            fig.update_layout(
+                height=250 + 30 * len(selected_models),
+                xaxis=dict(range=x_range, title=x_label),
+                yaxis=dict(title=""),
+                legend_title_text="",
+            )
             st.plotly_chart(fig, use_container_width=True)
+            st.caption("Filled = significant (q < 0.05, FDR-corrected).")
 
 
 def main():
@@ -476,7 +594,7 @@ def main():
     df = add_computed_columns(raw_df)
 
     tab1, tab2, tab3 = st.tabs([
-        "Correlations",
+        "Attribute-Credence Correlations",
         "Prompt Attributes",
         "Completeness",
     ])
