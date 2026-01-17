@@ -786,65 +786,6 @@ def render_correlations_tab(df: pl.DataFrame):
             st.plotly_chart(fig, use_container_width=True)
             st.caption("Filled = significant (q < 0.05, FDR-corrected). user_valence is raw; other attributes are direction-corrected.")
 
-    # --- Dispersion Analysis: How does credence IQR change with attribute level? ---
-    st.markdown("---")
-    st.markdown("**How does credence dispersion (IQR) vary with attribute level?**")
-    st.markdown(
-        "For each attribute, prompts are split at the median into low/high groups. "
-        "We measure the IQR of credences in each group. Δ IQR = IQR(high) - IQR(low)."
-    )
-
-    if attrs_to_show and selected_models:
-        dispersion_rows = []
-        for model_id in selected_models:
-            model_data = filtered.filter(pl.col("target_model_id") == model_id)
-            row = {"Test Model": _friendly_model_name(model_id), n_col: 0}
-
-            for attr in attrs_to_show:
-                consensus_col = f"consensus_{attr}"
-                if consensus_col in model_data.columns and "consensus_credence" in model_data.columns:
-                    valid = model_data.select([consensus_col, "consensus_credence"]).drop_nulls().to_pandas()
-                    if len(valid) >= 10:
-                        if row[n_col] == 0:
-                            row[n_col] = len(valid)
-                        attr_median = valid[consensus_col].median()
-                        low_group = valid[valid[consensus_col] < attr_median]["consensus_credence"]
-                        high_group = valid[valid[consensus_col] >= attr_median]["consensus_credence"]
-
-                        if len(low_group) >= 5 and len(high_group) >= 5:
-                            iqr_low = low_group.quantile(0.75) - low_group.quantile(0.25)
-                            iqr_high = high_group.quantile(0.75) - high_group.quantile(0.25)
-                            delta_iqr = iqr_high - iqr_low
-                            row[attr] = f"{delta_iqr:+.3f}"
-                        else:
-                            row[attr] = "-"
-                    else:
-                        row[attr] = "-"
-                else:
-                    row[attr] = "-"
-
-            dispersion_rows.append(row)
-
-        if dispersion_rows:
-            dispersion_df = pd.DataFrame(dispersion_rows)
-            # Use attrs_to_show order
-            available_cols = [c for c in attrs_to_show if c in dispersion_df.columns]
-            dispersion_df = dispersion_df[["Test Model", n_col] + available_cols]
-            # Rename columns
-            rename_map = {attr: attr_display[attr] for attr in available_cols}
-            dispersion_df = dispersion_df.rename(columns=rename_map)
-
-            # Build column config with tooltips
-            disp_col_config = {
-                "Test Model": st.column_config.TextColumn("Test Model", help="Model under test"),
-                n_col: st.column_config.NumberColumn(n_col, help="Number of samples with consensus credence"),
-            }
-            for attr in available_cols:
-                display_name = attr_display[attr]
-                disp_col_config[display_name] = st.column_config.TextColumn(display_name + " ⓘ", help=attr_tooltips[attr])
-
-            st.dataframe(dispersion_df, use_container_width=True, hide_index=True, column_config=disp_col_config)
-            st.caption("Positive Δ IQR: credence is more dispersed when attribute is high. Negative: less dispersed.")
 
 
 def main():
