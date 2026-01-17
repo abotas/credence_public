@@ -43,9 +43,6 @@ CONSENSUS_THRESHOLD = 0.2
 # Credence judge agreement threshold
 CREDENCE_AGREEMENT_THRESHOLD = 0.2
 
-# Preregistered exclusion threshold
-PROPOSITION_EXCLUSION_THRESHOLD = 0.30
-
 
 def _friendly_model_name(model_id: str) -> str:
     """Convert model ID to human-readable name."""
@@ -110,6 +107,44 @@ def add_computed_columns(_df: pl.DataFrame) -> pl.DataFrame:
             ])
 
     return df
+
+
+def _get_prompt_key_cols(df: pl.DataFrame) -> list[str]:
+    """Get list of columns that together uniquely identify a prompt across models."""
+    return ["prompt_id"]
+
+
+@st.cache_data
+def get_complete_consensus_prompts(_df: pl.DataFrame, selected_models: list[str]) -> pl.DataFrame:
+    """Find prompts where ALL selected models have consensus credence and prompt attributes.
+
+    Returns DataFrame with prompt key columns for prompts that pass the filter.
+    Use with semi-join to filter the main DataFrame.
+    """
+    if _df.is_empty() or not selected_models:
+        return pl.DataFrame()
+
+    key_cols = _get_prompt_key_cols(_df)
+    n_models = len(selected_models)
+
+    # Filter to selected models only
+    filtered = _df.filter(pl.col("target_model_id").is_in(selected_models))
+
+    # Group by prompt key (proposition + attributes identifies unique prompts across models)
+    # Count how many models have consensus_credence AND consensus_user_valence for each prompt
+    prompt_stats = filtered.group_by(key_cols).agg([
+        pl.col("target_model_id").n_unique().alias("n_models_total"),
+        (pl.col("consensus_credence").is_not_null() & pl.col("consensus_user_valence").is_not_null())
+        .sum().alias("n_models_with_consensus"),
+    ])
+
+    # Keep prompts where ALL models have consensus
+    complete_prompts = prompt_stats.filter(
+        (pl.col("n_models_total") == n_models) &
+        (pl.col("n_models_with_consensus") == n_models)
+    )
+
+    return complete_prompts.select(key_cols)
 
 
 def render_completeness_tab(df: pl.DataFrame):
@@ -349,12 +384,28 @@ def render_correlations_tab(df: pl.DataFrame):
     selected_model_names = st.session_state.get("corr_models", all_model_names)
     selected_models = [name_to_id[name] for name in selected_model_names if name in name_to_id]
 
+    # Read checkbox values from session_state (checkboxes rendered below first table)
+    require_all_consensus = st.session_state.get("corr_require_all_consensus", False)
+    show_direction_corrected = st.session_state.get("corr_show_direction_corrected", True)
+
     # Apply filters
     filtered = df
     if selected_domains:
         filtered = filtered.filter(pl.col("domain").is_in(selected_domains))
     if selected_models:
         filtered = filtered.filter(pl.col("target_model_id").is_in(selected_models))
+
+    if require_all_consensus and selected_models:
+        complete_prompts = get_complete_consensus_prompts(df, selected_models)
+        if not complete_prompts.is_empty():
+            key_cols = _get_prompt_key_cols(df)
+            # Semi-join: keep only rows whose prompt key is in complete_prompts
+            filtered = filtered.join(complete_prompts, on=key_cols, how="semi")
+            # Also require this specific row to have consensus (handles edge cases)
+            filtered = filtered.filter(
+                pl.col("consensus_credence").is_not_null() &
+                pl.col("consensus_user_valence").is_not_null()
+            )
 
     attrs_to_show = list(ATTRIBUTE_NAMES)
 
@@ -404,27 +455,41 @@ def render_correlations_tab(df: pl.DataFrame):
         return adjusted
 
     sensitivity_col = "Overall Sensitivity (R²)"
+    n_col = "N"
+    non_valence_attrs = [a for a in attrs_to_show if a != "user_valence"]
 
-    # Table: rows = models, columns = attributes + Overall Sensitivity
+    # === Compute both raw and direction-corrected correlations ===
     if attrs_to_show and selected_models:
-        # First pass: collect all correlations and p-values
+        # Raw correlations
         attr_r_values: dict[str, list[float]] = {attr: [] for attr in attrs_to_show}
-        model_results: list[dict] = []  # [{model_id, attr, r, p, r2_sensitivity}, ...]
+        model_results: list[dict] = []
+
+        # Direction-corrected correlations
+        dir_corr_results: list[dict] = []
+        dir_corr_all_p: list[float] = []
+        dir_corr_p_keys: list[tuple] = []
 
         for model_id in selected_models:
             model_data = filtered.filter(pl.col("target_model_id") == model_id)
-            model_entry = {"model_id": model_id, "correlations": {}, "sensitivity_r2": None}
+            model_entry = {"model_id": model_id, "correlations": {}, "sensitivity_r2": None, "n_samples": 0}
+            dir_entry = {"model_id": model_id, "correlations": {}, "interaction_r2": None, "n_samples": 0}
 
+            valence_col = "consensus_user_valence"
+            credence_col = "consensus_credence"
+
+            # --- Raw correlations ---
             for attr in attrs_to_show:
                 consensus_col = f"consensus_{attr}"
                 if consensus_col in model_data.columns:
                     valid = model_data.select([consensus_col, "consensus_credence"]).drop_nulls().to_pandas()
                     if len(valid) >= 3:
                         r, p = spearmanr(valid[consensus_col], valid["consensus_credence"])
-                        model_entry["correlations"][attr] = {"r": r, "p": p}
+                        model_entry["correlations"][attr] = {"r": r, "p": p, "n": len(valid)}
                         attr_r_values[attr].append(abs(r))
+                        if attr == "user_valence":
+                            model_entry["n_samples"] = len(valid)
 
-            # Compute Overall Sensitivity R²
+            # Raw Overall Sensitivity R²
             attr_cols = [f"consensus_{attr}" for attr in attrs_to_show]
             available_cols = [c for c in attr_cols if c in model_data.columns]
             if available_cols and "consensus_credence" in model_data.columns:
@@ -439,64 +504,174 @@ def render_correlations_tab(df: pl.DataFrame):
 
             model_results.append(model_entry)
 
-        # Collect all p-values and apply FDR correction
+            # --- Direction-corrected correlations ---
+            if valence_col in model_data.columns and credence_col in model_data.columns:
+                directional = model_data.filter(
+                    (pl.col(valence_col) < 0.4) | (pl.col(valence_col) > 0.6)
+                )
+
+                for attr in non_valence_attrs:
+                    attr_col = f"consensus_{attr}"
+                    if attr_col in directional.columns:
+                        valid = directional.select([valence_col, attr_col, credence_col]).drop_nulls().to_pandas()
+                        if len(valid) >= 10:
+                            agreement = np.where(
+                                valid[valence_col] > 0.5,
+                                valid[credence_col],
+                                1 - valid[credence_col]
+                            )
+                            r, p = spearmanr(valid[attr_col], agreement)
+                            dir_entry["correlations"][attr] = {"r": r, "p": p, "n": len(valid)}
+                            dir_corr_all_p.append(p)
+                            dir_corr_p_keys.append((len(dir_corr_results), attr))
+                            if dir_entry["n_samples"] == 0:
+                                dir_entry["n_samples"] = len(valid)
+
+                # Direction-corrected Overall Sensitivity R²
+                other_cols = [f"consensus_{a}" for a in non_valence_attrs]
+                available_other = [c for c in other_cols if c in directional.columns]
+                if available_other:
+                    reg_data = directional.select([valence_col] + available_other + [credence_col]).drop_nulls().to_pandas()
+                    n = len(reg_data)
+                    num_features = 1 + len(available_other)
+                    if n >= num_features + 2:
+                        valence_vals = reg_data[valence_col].values
+                        X_cols = [valence_vals]
+                        for col in available_other:
+                            X_cols.append(valence_vals * reg_data[col].values)
+                        X = np.column_stack(X_cols)
+                        y = reg_data[credence_col].values
+                        model_reg = LinearRegression().fit(X, y)
+                        dir_entry["interaction_r2"] = model_reg.score(X, y)
+
+            dir_corr_results.append(dir_entry)
+
+        # FDR correction for raw correlations
         all_p_values = []
-        p_value_keys = []  # (model_idx, attr) tuples to map back
+        p_value_keys = []
         for model_idx, entry in enumerate(model_results):
             for attr, corr in entry["correlations"].items():
                 all_p_values.append(corr["p"])
                 p_value_keys.append((model_idx, attr))
-
         if all_p_values:
             adjusted_p = apply_fdr_correction(all_p_values)
             for i, (model_idx, attr) in enumerate(p_value_keys):
                 model_results[model_idx]["correlations"][attr]["q"] = adjusted_p[i]
 
-        # Build table rows
-        model_corr_rows = []
-        for entry in model_results:
-            row = {"Test Model": _friendly_model_name(entry["model_id"])}
-            for attr in attrs_to_show:
-                if attr in entry["correlations"]:
-                    corr = entry["correlations"][attr]
-                    r = corr["r"]
-                    q = corr["q"]
-                    if show_r2:
-                        row[attr] = f"{r**2:.3f}{sig_stars(q)}"
+        # FDR correction for direction-corrected correlations
+        if dir_corr_all_p:
+            adjusted_p = apply_fdr_correction(dir_corr_all_p)
+            for i, (row_idx, attr) in enumerate(dir_corr_p_keys):
+                if dir_corr_results[row_idx]["correlations"].get(attr):
+                    dir_corr_results[row_idx]["correlations"][attr]["q"] = adjusted_p[i]
+
+        # === Build table: raw or direction-corrected based on checkbox ===
+        if show_direction_corrected:
+            # Direction-corrected: user_valence from raw, others from dir_corr_results
+            table_attrs = attrs_to_show  # includes user_valence
+            model_corr_rows = []
+            for model_idx, dir_entry in enumerate(dir_corr_results):
+                raw_entry = model_results[model_idx]
+                row = {"Test Model": _friendly_model_name(dir_entry["model_id"]), n_col: dir_entry["n_samples"]}
+                for attr in table_attrs:
+                    if attr == "user_valence":
+                        # Use raw correlation for user_valence
+                        if attr in raw_entry["correlations"]:
+                            corr = raw_entry["correlations"][attr]
+                            r = corr["r"]
+                            q = corr["q"]
+                            if show_r2:
+                                row[attr] = f"{r**2:.3f}"
+                            else:
+                                row[attr] = f"{r:+.3f}{sig_stars(q)}"
+                        else:
+                            row[attr] = "-"
                     else:
-                        row[attr] = f"{r:+.3f}{sig_stars(q)}"
+                        # Use direction-corrected for other attributes
+                        res = dir_entry["correlations"].get(attr)
+                        if res and "q" in res:
+                            r = res["r"]
+                            q = res["q"]
+                            if show_r2:
+                                row[attr] = f"{r**2:.3f}"
+                            else:
+                                row[attr] = f"{r:+.3f}{sig_stars(q)}"
+                        else:
+                            row[attr] = "-"
+                if dir_entry["interaction_r2"] is not None:
+                    row[sensitivity_col] = f"{dir_entry['interaction_r2']:.3f}"
                 else:
-                    row[attr] = "-"
-
-            if entry["sensitivity_r2"] is not None:
-                row[sensitivity_col] = f"{entry['sensitivity_r2']:.3f}"
-            else:
-                row[sensitivity_col] = "-"
-
-            model_corr_rows.append(row)
+                    row[sensitivity_col] = "-"
+                model_corr_rows.append(row)
+            n_col_help = "Number of directional samples (user_valence not in 0.4-0.6)"
+            sensitivity_help = "R² from user_valence + (user_valence x attr) interactions"
+            table_caption = (
+                "**Attribute correlations with measured credence**<br>"
+                "user valence: raw correlation with credence.<br>"
+                "†Direction-corrected: correlation with agreement, where agreement = credence for believing users, (1 - credence) for skeptical users. "
+                "Positive = attribute increases model agreement with user's apparent belief. Neutral prompts (0.4-0.6) excluded.<br>"
+                "\\* q<0.05, \\*\\* q<0.01, \\*\\*\\* q<0.001 (FDR-corrected)."
+            )
+            use_html_caption = True
+        else:
+            # Raw correlations: use model_results, all attributes
+            table_attrs = attrs_to_show
+            model_corr_rows = []
+            for entry in model_results:
+                row = {"Test Model": _friendly_model_name(entry["model_id"]), n_col: entry["n_samples"]}
+                for attr in table_attrs:
+                    if attr in entry["correlations"]:
+                        corr = entry["correlations"][attr]
+                        r = corr["r"]
+                        q = corr["q"]
+                        if show_r2:
+                            row[attr] = f"{r**2:.3f}"
+                        else:
+                            row[attr] = f"{r:+.3f}{sig_stars(q)}"
+                    else:
+                        row[attr] = "-"
+                if entry["sensitivity_r2"] is not None:
+                    row[sensitivity_col] = f"{entry['sensitivity_r2']:.3f}"
+                else:
+                    row[sensitivity_col] = "-"
+                model_corr_rows.append(row)
+            n_col_help = "Number of samples with consensus credence"
+            sensitivity_help = "R² from regressing credence on all prompt attributes"
+            table_caption = "\\* q<0.05, \\*\\* q<0.01, \\*\\*\\* q<0.001 (FDR-corrected). Overall Sensitivity: variance explained by all prompt attributes."
+            use_html_caption = False
 
         if model_corr_rows:
-            # Sort attributes by mean |r| descending
-            attr_mean_abs_r = {attr: (sum(vals) / len(vals) if vals else 0) for attr, vals in attr_r_values.items()}
-            sorted_attrs = sorted(attrs_to_show, key=lambda a: attr_mean_abs_r[a], reverse=True)
+            # Sort attributes by mean |r| for column ordering
+            if not show_direction_corrected:
+                attr_mean_abs_r = {attr: (sum(vals) / len(vals) if vals else 0) for attr, vals in attr_r_values.items()}
+                sorted_attrs = sorted(table_attrs, key=lambda a: attr_mean_abs_r.get(a, 0), reverse=True)
+            else:
+                sorted_attrs = table_attrs
 
             model_corr_df = pd.DataFrame(model_corr_rows)
-            model_corr_df = model_corr_df[["Test Model"] + sorted_attrs + [sensitivity_col]]
-
-            # Rename columns to display names
+            model_corr_df = model_corr_df[["Test Model", n_col] + sorted_attrs + [sensitivity_col]]
+            # Sort by Overall Sensitivity descending (extract numeric value from formatted string)
+            model_corr_df["_sort_key"] = model_corr_df[sensitivity_col].apply(
+                lambda x: float(x.split("*")[0]) if x != "-" else -1
+            )
+            model_corr_df = model_corr_df.sort_values("_sort_key", ascending=False).drop(columns=["_sort_key"])
             rename_map = {attr: attr_display[attr] for attr in sorted_attrs}
             model_corr_df = model_corr_df.rename(columns=rename_map)
 
-            # Build column config with tooltips (add ⓘ to hint hover)
             col_config = {
                 "Test Model": st.column_config.TextColumn("Test Model", help="Model under test"),
-                sensitivity_col: st.column_config.TextColumn(sensitivity_col + " ⓘ", help="R² from regressing credence on all prompt attributes"),
+                n_col: st.column_config.NumberColumn(n_col, help=n_col_help),
+                sensitivity_col: st.column_config.TextColumn(sensitivity_col + " ⓘ", help=sensitivity_help),
             }
             for attr in sorted_attrs:
                 display_name = attr_display[attr]
-                col_config[display_name] = st.column_config.TextColumn(display_name + " ⓘ", help=attr_tooltips[attr])
+                # Add † to non-valence attributes when direction-corrected
+                if show_direction_corrected and attr != "user_valence":
+                    col_config[display_name] = st.column_config.TextColumn(display_name + "† ⓘ", help=attr_tooltips[attr])
+                else:
+                    col_config[display_name] = st.column_config.TextColumn(display_name + " ⓘ", help=attr_tooltips[attr])
 
-            # Controls row: display mode toggle + filters
+            # Controls row
             ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([1, 1.5, 1.5])
             with ctrl_col1:
                 st.radio("Display mode", ["Spearman Correlation", "R²"], horizontal=True, key="corr_display_mode", label_visibility="collapsed")
@@ -507,18 +682,49 @@ def render_correlations_tab(df: pl.DataFrame):
                 with st.expander("Test Models", expanded=False):
                     st.multiselect("Select models", all_model_names, default=all_model_names, key="corr_models", label_visibility="collapsed")
 
-            # Table
             st.dataframe(model_corr_df, use_container_width=True, hide_index=True, column_config=col_config)
-            st.caption("\\* q<0.05, \\*\\* q<0.01, \\*\\*\\* q<0.001 (FDR-corrected). Overall Sensitivity: variance explained by all prompt attributes.")
+            st.caption(table_caption, unsafe_allow_html=use_html_caption)
 
-    # Coefficient plot: dots showing r or r² values per model, colored by attribute
-    if attrs_to_show and selected_models and model_corr_rows:
+            # Checkboxes below table
+            chk_col1, chk_col2 = st.columns(2)
+            with chk_col1:
+                st.checkbox(
+                    "Correct for valence direction",
+                    value=True,
+                    key="corr_show_direction_corrected",
+                    help=(
+                        "Prompts with neutral user_valence (0.4-0.6) are excluded. "
+                        "For low-valence prompts (skeptical user), credence is flipped to (1 - credence) "
+                        "so that correlations are interpretable: positive correlation means the attribute "
+                        "pushes the model's expressed credence toward the user's apparent belief."
+                    ),
+                )
+            with chk_col2:
+                st.checkbox(
+                    "Only include prompts where all models have consensus",
+                    value=False,
+                    key="corr_require_all_consensus",
+                    help="Filters to prompts where all selected models have both credence consensus and prompt attribute consensus. All model stats are computed from the exact same set of prompts.",
+                )
+
+        # === Coefficient plot: user_valence raw, others direction-corrected ===
         coef_data = []
-        for entry in model_results:
+        for model_idx, entry in enumerate(model_results):
             model_name = _friendly_model_name(entry["model_id"])
-            for attr in sorted_attrs:
-                if attr in entry["correlations"]:
-                    corr = entry["correlations"][attr]
+            # user_valence from raw correlations
+            if "user_valence" in entry["correlations"]:
+                corr = entry["correlations"]["user_valence"]
+                coef_data.append({
+                    "Model": model_name,
+                    "Attribute": attr_display["user_valence"],
+                    "value": corr["r"]**2 if show_r2 else corr["r"],
+                    "significant": corr["q"] < 0.05,
+                })
+            # Other attributes from direction-corrected
+            dir_entry = dir_corr_results[model_idx]
+            for attr in non_valence_attrs:
+                if attr in dir_entry["correlations"] and "q" in dir_entry["correlations"][attr]:
+                    corr = dir_entry["correlations"][attr]
                     coef_data.append({
                         "Model": model_name,
                         "Attribute": attr_display[attr],
@@ -529,7 +735,6 @@ def render_correlations_tab(df: pl.DataFrame):
         if coef_data:
             coef_df = pd.DataFrame(coef_data)
             x_label = "r²" if show_r2 else "Spearman r"
-            # Compute dynamic range based on actual data
             min_val = coef_df["value"].min()
             max_val = coef_df["value"].max()
             padding = (max_val - min_val) * 0.1 if max_val > min_val else 0.1
@@ -537,17 +742,17 @@ def render_correlations_tab(df: pl.DataFrame):
                 x_range = [0, max(0.5, max_val + padding)]
             else:
                 x_range = [min(-0.5, min_val - padding), max(0.5, max_val + padding)]
-            # Build plot manually for cleaner legend
+
             fig = go.Figure()
             colors = px.colors.qualitative.Plotly
-            attr_colors = {attr_display[attr]: colors[i % len(colors)] for i, attr in enumerate(sorted_attrs)}
+            plot_attrs = ["user_valence"] + non_valence_attrs
+            attr_colors = {attr_display[attr]: colors[i % len(colors)] for i, attr in enumerate(plot_attrs)}
 
-            for attr in sorted_attrs:
+            for attr in plot_attrs:
                 attr_name = attr_display[attr]
                 color = attr_colors[attr_name]
                 attr_data = coef_df[coef_df["Attribute"] == attr_name]
 
-                # Significant (filled)
                 sig_data = attr_data[attr_data["significant"]]
                 if not sig_data.empty:
                     fig.add_trace(go.Scatter(
@@ -559,7 +764,6 @@ def render_correlations_tab(df: pl.DataFrame):
                         showlegend=True,
                     ))
 
-                # Not significant (open)
                 nonsig_data = attr_data[~attr_data["significant"]]
                 if not nonsig_data.empty:
                     fig.add_trace(go.Scatter(
@@ -568,7 +772,7 @@ def render_correlations_tab(df: pl.DataFrame):
                         marker=dict(size=10, color=color, symbol="circle-open", line=dict(width=2, color=color)),
                         name=attr_name,
                         legendgroup=attr_name,
-                        showlegend=sig_data.empty,  # Only show in legend if no filled version
+                        showlegend=sig_data.empty,
                     ))
 
             if not show_r2:
@@ -580,7 +784,67 @@ def render_correlations_tab(df: pl.DataFrame):
                 legend_title_text="",
             )
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("Filled = significant (q < 0.05, FDR-corrected).")
+            st.caption("Filled = significant (q < 0.05, FDR-corrected). user_valence is raw; other attributes are direction-corrected.")
+
+    # --- Dispersion Analysis: How does credence IQR change with attribute level? ---
+    st.markdown("---")
+    st.markdown("**How does credence dispersion (IQR) vary with attribute level?**")
+    st.markdown(
+        "For each attribute, prompts are split at the median into low/high groups. "
+        "We measure the IQR of credences in each group. Δ IQR = IQR(high) - IQR(low)."
+    )
+
+    if attrs_to_show and selected_models:
+        dispersion_rows = []
+        for model_id in selected_models:
+            model_data = filtered.filter(pl.col("target_model_id") == model_id)
+            row = {"Test Model": _friendly_model_name(model_id), n_col: 0}
+
+            for attr in attrs_to_show:
+                consensus_col = f"consensus_{attr}"
+                if consensus_col in model_data.columns and "consensus_credence" in model_data.columns:
+                    valid = model_data.select([consensus_col, "consensus_credence"]).drop_nulls().to_pandas()
+                    if len(valid) >= 10:
+                        if row[n_col] == 0:
+                            row[n_col] = len(valid)
+                        attr_median = valid[consensus_col].median()
+                        low_group = valid[valid[consensus_col] < attr_median]["consensus_credence"]
+                        high_group = valid[valid[consensus_col] >= attr_median]["consensus_credence"]
+
+                        if len(low_group) >= 5 and len(high_group) >= 5:
+                            iqr_low = low_group.quantile(0.75) - low_group.quantile(0.25)
+                            iqr_high = high_group.quantile(0.75) - high_group.quantile(0.25)
+                            delta_iqr = iqr_high - iqr_low
+                            row[attr] = f"{delta_iqr:+.3f}"
+                        else:
+                            row[attr] = "-"
+                    else:
+                        row[attr] = "-"
+                else:
+                    row[attr] = "-"
+
+            dispersion_rows.append(row)
+
+        if dispersion_rows:
+            dispersion_df = pd.DataFrame(dispersion_rows)
+            # Use attrs_to_show order
+            available_cols = [c for c in attrs_to_show if c in dispersion_df.columns]
+            dispersion_df = dispersion_df[["Test Model", n_col] + available_cols]
+            # Rename columns
+            rename_map = {attr: attr_display[attr] for attr in available_cols}
+            dispersion_df = dispersion_df.rename(columns=rename_map)
+
+            # Build column config with tooltips
+            disp_col_config = {
+                "Test Model": st.column_config.TextColumn("Test Model", help="Model under test"),
+                n_col: st.column_config.NumberColumn(n_col, help="Number of samples with consensus credence"),
+            }
+            for attr in available_cols:
+                display_name = attr_display[attr]
+                disp_col_config[display_name] = st.column_config.TextColumn(display_name + " ⓘ", help=attr_tooltips[attr])
+
+            st.dataframe(dispersion_df, use_container_width=True, hide_index=True, column_config=disp_col_config)
+            st.caption("Positive Δ IQR: credence is more dispersed when attribute is high. Negative: less dispersed.")
 
 
 def main():
