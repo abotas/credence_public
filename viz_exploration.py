@@ -6,6 +6,7 @@ Usage:
 Explores credence measurements across domains, models, and prompt characteristics.
 """
 
+import math
 from pathlib import Path
 from statistics import median
 
@@ -337,7 +338,7 @@ def render_prompt_attributes_tab(df: pl.DataFrame):
                     range_x=[0, 1],
                 )
                 hist_fig.update_traces(
-                    xbins=dict(start=0, end=1, size=0.05),
+                    xbins=dict(start=0, end=1, size=0.1),
                     marker_color=attr_colors[display_name],
                 )
                 hist_fig.update_layout(
@@ -772,6 +773,449 @@ def render_correlations_detail_tab(df: pl.DataFrame):
     st.caption("Format: R² (CV: 3-fold cross-validated R²). Valence-only = baseline. + Interactions = with (v-0.5)×attr terms.")
 
 
+def render_explorer_tab(df: pl.DataFrame):
+    """Render interactive explorer tab with filters and histogram."""
+    st.subheader("Distributions Explorer")
+    st.caption("Filter samples by model, domain, and prompt attributes to explore credence distributions.")
+
+    if df.is_empty():
+        st.warning("No data found.")
+        return
+
+    # Check for required columns
+    has_attrs = "consensus_user_valence" in df.columns
+    if not has_attrs:
+        st.warning("Prompt attributes not yet scored. Run run_exploration.py first.")
+        return
+
+    # Attribute display names
+    attr_display = {
+        "user_valence": "User Valence",
+        "sophistication": "Sophistication",
+        "apparent_stakes": "Stakes",
+        "emotionality": "Emotionality",
+        "user_authority": "Authority",
+        "confrontationality": "Confrontationality",
+        "clarity": "Clarity",
+    }
+
+    # Get filter options
+    all_domains = sorted(df["domain"].unique().to_list()) if "domain" in df.columns else []
+    all_models_list = sorted(df["target_model_id"].unique().to_list())
+    all_model_names = [_friendly_model_name(m) for m in all_models_list]
+    name_to_id = {_friendly_model_name(m): m for m in all_models_list}
+
+    # Model and domain filters (collapsible)
+    with st.expander("Filters", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            selected_model_names = st.multiselect(
+                "Models",
+                all_model_names,
+                default=all_model_names,
+                key="explorer_models",
+            )
+        with col2:
+            selected_domains = st.multiselect(
+                "Domains",
+                all_domains,
+                default=all_domains,
+                key="explorer_domains",
+            )
+
+    selected_models = [name_to_id[name] for name in selected_model_names if name in name_to_id]
+
+    # Attribute filter selection
+    all_attr_options = [attr_display[attr] for attr in ATTRIBUTE_NAMES]
+    display_to_attr = {attr_display[attr]: attr for attr in ATTRIBUTE_NAMES}
+
+    selected_attr_names = st.multiselect(
+        "Prompt Attribute Filters",
+        all_attr_options,
+        default=["User Valence"],
+        key="explorer_attr_select",
+    )
+    selected_attrs = [display_to_attr[name] for name in selected_attr_names]
+
+    # Show sliders for selected attributes
+    attr_ranges = {}
+    if selected_attrs:
+        n_attrs = len(selected_attrs)
+        cols = st.columns(min(n_attrs, 4))
+        for i, attr in enumerate(selected_attrs):
+            with cols[i % min(n_attrs, 4)]:
+                attr_ranges[attr] = st.slider(
+                    attr_display[attr],
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=(0.0, 1.0),
+                    step=0.05,
+                    key=f"explorer_{attr}",
+                )
+
+    # Apply model/domain filters (baseline for histogram outline)
+    baseline_df = df
+    if selected_models:
+        baseline_df = baseline_df.filter(pl.col("target_model_id").is_in(selected_models))
+    if selected_domains:
+        baseline_df = baseline_df.filter(pl.col("domain").is_in(selected_domains))
+
+    # Apply attribute range filters
+    filtered_df = baseline_df
+    for attr, (low, high) in attr_ranges.items():
+        consensus_col = f"consensus_{attr}"
+        if consensus_col in filtered_df.columns:
+            # Only filter if range is not full [0, 1]
+            if low > 0.0 or high < 1.0:
+                filtered_df = filtered_df.filter(
+                    (pl.col(consensus_col) >= low - 1e-9) &
+                    (pl.col(consensus_col) <= high + 1e-9)
+                )
+
+    # Histograms in 2-column grid
+    if not selected_models:
+        st.info("Select at least one model to see histograms.")
+        return
+
+    # Helper to format shift with color
+    def format_shift(shift):
+        if abs(shift) < 0.005:
+            return ""
+        color = "#2ca02c" if shift > 0 else "#d62728"  # green/red
+        return f' <span style="color:{color}">({shift:+.2f})</span>'
+
+    # Create 2-column layout
+    cols = st.columns(2)
+    for i, model_id in enumerate(selected_models):
+        # Baseline (unfiltered by attributes) for outline
+        baseline_model_df = baseline_df.filter(pl.col("target_model_id") == model_id)
+        baseline_credences = baseline_model_df["consensus_credence"].drop_nulls().to_list()
+
+        # Filtered data
+        model_df = filtered_df.filter(pl.col("target_model_id") == model_id)
+        credences = model_df["consensus_credence"].drop_nulls().to_list()
+        model_name = _friendly_model_name(model_id)
+
+        # Color by provider: OpenAI brand teal, Anthropic brand coral
+        if model_id.startswith("openai/"):
+            bar_color = "#10a37f"  # OpenAI teal
+        elif model_id.startswith("anthropic/"):
+            bar_color = "#d97757"  # Anthropic coral
+        else:
+            bar_color = "#1f77b4"  # default blue
+
+        n_baseline = len(baseline_credences)
+        n_filtered = len(credences)
+
+        # Baseline stats
+        baseline_mean = sum(baseline_credences) / len(baseline_credences) if baseline_credences else 0
+        baseline_median = median(baseline_credences) if baseline_credences else 0
+
+        fig = go.Figure()
+
+        # Filtered histogram first (with opacity so outline shows through)
+        if credences:
+            mean_cred = sum(credences) / len(credences)
+            median_cred = median(credences)
+
+            # Calculate shifts
+            mean_shift = mean_cred - baseline_mean
+            median_shift = median_cred - baseline_median
+
+            fig.add_trace(go.Histogram(
+                x=credences,
+                xbins=dict(start=0, end=1, size=0.1),
+                histnorm="percent",
+                marker=dict(color=bar_color, opacity=0.6),
+                name="Filtered",
+                showlegend=False,
+            ))
+
+            legend_text = (
+                f"n={n_filtered}/{n_baseline}<br>"
+                f"mean={mean_cred:.2f}{format_shift(mean_shift)}<br>"
+                f"median={median_cred:.2f}{format_shift(median_shift)}"
+            )
+        else:
+            legend_text = f"n=0/{n_baseline}"
+
+        # Baseline histogram as outline on top (gray, unfilled)
+        if baseline_credences:
+            fig.add_trace(go.Histogram(
+                x=baseline_credences,
+                xbins=dict(start=0, end=1, size=0.1),
+                histnorm="percent",
+                marker=dict(color="rgba(0,0,0,0)", line=dict(color="#888888", width=1.5)),
+                name="All",
+                showlegend=False,
+            ))
+
+        fig.update_layout(
+            height=180,
+            title=model_name,
+            title_font_size=12,
+            xaxis=dict(range=[0, 1], title="Credence", title_font_size=10),
+            yaxis=dict(title="Percent", title_font_size=10),
+            margin=dict(l=40, r=100, t=35, b=30),
+            bargap=0.1,
+            barmode="overlay",
+            annotations=[
+                dict(
+                    text=legend_text,
+                    xref="paper", yref="paper",
+                    x=1.02, y=0.95,
+                    xanchor="left", yanchor="top",
+                    showarrow=False,
+                    font=dict(size=10),
+                    align="left",
+                )
+            ],
+        )
+
+        with cols[i % 2]:
+            st.plotly_chart(fig, use_container_width=True)
+
+
+def render_model_agreement_tab(df: pl.DataFrame):
+    """Render model agreement heatmap tab."""
+    st.subheader("Model Agreement")
+    st.caption("Correlation of credences across shared prompts. Higher = models agree on which propositions deserve high/low credence.")
+
+    if df.is_empty():
+        st.warning("No data found.")
+        return
+
+    # Get filter options
+    all_models_list = sorted(df["target_model_id"].unique().to_list())
+    all_model_names = [_friendly_model_name(m) for m in all_models_list]
+    name_to_id = {_friendly_model_name(m): m for m in all_models_list}
+    all_domains = sorted(df["domain"].unique().to_list()) if "domain" in df.columns else []
+
+    # Filters
+    with st.expander("Filters", expanded=False):
+        col1, col2, col3 = st.columns([2, 2, 1])
+        with col1:
+            selected_model_names = st.multiselect(
+                "Models",
+                all_model_names,
+                default=all_model_names,
+                key="agreement_models",
+            )
+        with col2:
+            selected_domains = st.multiselect(
+                "Domains",
+                all_domains,
+                default=all_domains,
+                key="agreement_domains",
+            )
+        with col3:
+            corr_type = st.radio("Correlation", ["Pearson", "Spearman"], horizontal=True, key="agreement_corr_type")
+
+    selected_models = [name_to_id[name] for name in selected_model_names if name in name_to_id]
+
+    # Apply filters
+    filtered_df = df
+    if selected_models:
+        filtered_df = filtered_df.filter(pl.col("target_model_id").is_in(selected_models))
+    if selected_domains:
+        filtered_df = filtered_df.filter(pl.col("domain").is_in(selected_domains))
+
+    if len(selected_models) < 2:
+        st.warning("Select at least 2 models to compare.")
+        return
+
+    # Pivot data to get credences per prompt per model
+    pivot_df = filtered_df.filter(
+        pl.col("consensus_credence").is_not_null()
+    ).select(["prompt_id", "target_model_id", "consensus_credence"]).to_pandas()
+
+    if len(pivot_df) == 0:
+        st.warning("No consensus credences found.")
+        return
+
+    pivot_wide = pivot_df.pivot(index="prompt_id", columns="target_model_id", values="consensus_credence")
+
+    # Custom model order for display
+    model_order_preference = [
+        "anthropic/claude-haiku-4-5-20251001",
+        "anthropic/claude-sonnet-4-5-20250929",
+        "openai/gpt-4o-2024-11-20",
+        "openai/gpt-5-nano-2025-08-07",
+        "openai/gpt-5-mini-2025-08-07",
+        "openai/gpt-5-2-2025-12-11",
+        "openai/gpt-5-2-chat-latest",
+    ]
+    model_rank = {m: i for i, m in enumerate(model_order_preference)}
+    selected_models_ordered = sorted(selected_models, key=lambda m: model_rank.get(m, 999))
+
+    # Calculate pairwise correlations
+    n_models = len(selected_models_ordered)
+    corr_matrix = np.full((n_models, n_models), np.nan)
+
+    corr_func = spearmanr if corr_type == "Spearman" else pearsonr
+
+    for i, m1 in enumerate(selected_models_ordered):
+        for j, m2 in enumerate(selected_models_ordered):
+            if i == j:
+                corr_matrix[i, j] = 1.0
+            elif m1 in pivot_wide.columns and m2 in pivot_wide.columns:
+                valid = pivot_wide[[m1, m2]].dropna()
+                if len(valid) >= 10:
+                    r, _ = corr_func(valid[m1].values, valid[m2].values)
+                    corr_matrix[i, j] = r
+
+    # Create friendly names for display
+    friendly_names = [_friendly_model_name(m) for m in selected_models_ordered]
+
+    # Collect unique pairs (i < j only to avoid duplicates)
+    pair_correlations = []
+    for i in range(n_models):
+        for j in range(i + 1, n_models):
+            if not math.isnan(corr_matrix[i, j]):
+                pair_correlations.append({
+                    "Model 1": friendly_names[i],
+                    "Model 2": friendly_names[j],
+                    "r": corr_matrix[i, j],
+                })
+
+    if pair_correlations:
+        # Sort by correlation descending (most similar first)
+        pair_correlations.sort(key=lambda x: x["r"], reverse=True)
+
+        # Auto-scale color range
+        r_values = [p["r"] for p in pair_correlations]
+        z_min = min(r_values) - 0.02
+        z_max = max(r_values) + 0.02
+    else:
+        z_min, z_max = 0, 1
+
+    # Format text labels
+    text_labels = []
+    for i in range(n_models):
+        text_row = []
+        for j in range(n_models):
+            v = corr_matrix[i, j]
+            if math.isnan(v):
+                text_row.append("")
+            else:
+                text_row.append(f"{v:.2f}")
+        text_labels.append(text_row)
+
+    # Build heatmap figure
+    fig_corr = go.Figure(data=go.Heatmap(
+        z=corr_matrix,
+        x=friendly_names,
+        y=friendly_names,
+        text=text_labels,
+        texttemplate="%{text}",
+        colorscale="RdBu_r",
+        zmin=z_min,
+        zmax=z_max,
+        colorbar=dict(title="r"),
+    ))
+    fig_corr.update_layout(
+        height=400,
+        margin=dict(l=120, r=20, t=20, b=120),
+        xaxis=dict(tickangle=45),
+    )
+
+    # Build domain strip plot if we have domain data
+    fig_strip = None
+    if "domain" in filtered_df.columns and selected_domains:
+        domain_corr_points = []
+        domain_means = {}
+
+        for domain in selected_domains:
+            domain_df = filtered_df.filter(pl.col("domain") == domain)
+            domain_pivot_df = domain_df.filter(
+                pl.col("consensus_credence").is_not_null()
+            ).select(["prompt_id", "target_model_id", "consensus_credence"]).to_pandas()
+
+            if len(domain_pivot_df) < 10:
+                continue
+
+            domain_pivot = domain_pivot_df.pivot(index="prompt_id", columns="target_model_id", values="consensus_credence")
+
+            domain_corrs = []
+            for i, m1 in enumerate(selected_models_ordered):
+                for j, m2 in enumerate(selected_models_ordered):
+                    if i < j and m1 in domain_pivot.columns and m2 in domain_pivot.columns:
+                        valid = domain_pivot[[m1, m2]].dropna()
+                        if len(valid) >= 10:
+                            r, _ = corr_func(valid[m1].values, valid[m2].values)
+                            domain_corrs.append(r)
+                            domain_corr_points.append({
+                                "Domain": domain,
+                                "r": r,
+                                "model1": _friendly_model_name(m1),
+                                "model2": _friendly_model_name(m2),
+                            })
+
+            if domain_corrs:
+                domain_means[domain] = sum(domain_corrs) / len(domain_corrs)
+
+        if domain_corr_points:
+            points_df = pd.DataFrame(domain_corr_points)
+            sorted_domains = sorted(domain_means.keys(), key=lambda d: domain_means[d])
+
+            fig_strip = go.Figure()
+
+            for domain in sorted_domains:
+                domain_data = points_df[points_df["Domain"] == domain]
+                domain_r = domain_data["r"].values
+                domain_m1 = domain_data["model1"].values
+                domain_m2 = domain_data["model2"].values
+                jitter = np.random.uniform(-0.2, 0.2, len(domain_r))
+                y_positions = [sorted_domains.index(domain) + j for j in jitter]
+
+                fig_strip.add_trace(go.Scatter(
+                    x=domain_r,
+                    y=y_positions,
+                    mode="markers",
+                    marker=dict(size=8, opacity=0.6),
+                    name=domain,
+                    showlegend=False,
+                    customdata=list(zip(domain_m1, domain_m2)),
+                    hovertemplate="%{customdata[0]} & %{customdata[1]}<br>r=%{x:.2f}<extra></extra>",
+                ))
+                fig_strip.add_trace(go.Scatter(
+                    x=[domain_means[domain]],
+                    y=[sorted_domains.index(domain)],
+                    mode="markers",
+                    marker=dict(size=14, symbol="diamond", color="black", line=dict(width=2, color="white")),
+                    showlegend=False,
+                    hovertemplate=f"Mean: %{{x:.2f}}<extra></extra>",
+                ))
+
+            fig_strip.update_layout(
+                height=400,
+                margin=dict(l=120, r=20, t=20, b=40),
+                xaxis=dict(title="Pairwise Correlation (r)", range=[0, 1]),
+                yaxis=dict(
+                    tickmode="array",
+                    tickvals=list(range(len(sorted_domains))),
+                    ticktext=sorted_domains,
+                    title="",
+                ),
+            )
+
+    # Display heatmap, then strip plot below
+    st.plotly_chart(fig_corr, use_container_width=True)
+
+    if pair_correlations:
+        most_similar = pair_correlations[0]
+        least_similar = pair_correlations[-1]
+        st.caption(
+            f"Most similar: **{most_similar['Model 1']}** & **{most_similar['Model 2']}** (r={most_similar['r']:.2f}) | "
+            f"Least similar: **{least_similar['Model 1']}** & **{least_similar['Model 2']}** (r={least_similar['r']:.2f})"
+        )
+
+    if fig_strip:
+        st.markdown("**Agreement by Domain**")
+        st.plotly_chart(fig_strip, use_container_width=True)
+        st.caption("Each dot = one model pair. Diamonds = domain means.")
+
+
 def main():
     st.set_page_config(page_title="Exploration Results", layout="wide")
     st.title("Part 2: Exploration Results")
@@ -780,9 +1224,11 @@ def main():
     raw_df = load_exploration_parquet()
     df = add_computed_columns(raw_df)
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Correlations",
         "Prompt Attributes",
+        "Credence Distributions",
+        "Model Agreement",
         "Completeness",
     ])
 
@@ -793,6 +1239,12 @@ def main():
         render_prompt_attributes_tab(df)
 
     with tab3:
+        render_explorer_tab(df)
+
+    with tab4:
+        render_model_agreement_tab(df)
+
+    with tab5:
         render_completeness_tab(df)
 
 

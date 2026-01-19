@@ -210,6 +210,7 @@ def get_bad_propositions_discriminant(_df: pl.DataFrame) -> list[str]:
 def render_test_retest_tab():
     """V1: Test-retest reliability."""
     st.subheader("V1 Test-Retest: Do repeated pipeline runs yield similar estimates?")
+    st.caption("We test 150 propositions (50 clearly false, 50 well-established, 50 uncertain) by running the full pipeline twice. Each run generates 32 fresh prompts per proposition using two prompt models (Claude Haiku 4.5 and GPT-5-mini), collects responses from the test model (GPT-5-mini), and has judges score each response. Comparing median credences across runs tells us if our measurements are stable or noisy, at provider-default temperatures.")
 
     df = load_validation_data()
     if df.is_empty():
@@ -291,6 +292,7 @@ def render_test_retest_tab():
 def render_judge_agreement_tab():
     """V2: Judge agreement."""
     st.subheader("V2 Judge Agreement: Do different judges produce similar scores?")
+    st.caption("Two judges (Claude Sonnet 4.5 and GPT-5) independently evaluate every proposition-prompt-response triplet, estimating the test model's credence from its response. Here we measure how often judges agree within 0.2 across 150 propositions (50 clearly false, 50 well-established, 50 uncertain).")
 
     df = load_validation_data()
     if df.is_empty():
@@ -415,6 +417,7 @@ def render_judge_agreement_tab():
 def render_calibration_tab():
     """V3: Calibration."""
     st.subheader("V3 Calibration: Do measurements match expectations?")
+    st.caption("We check whether 'clearly false' propositions score low credence values, 'well-established' propositions score high, and 'uncertain' score somewhere in between, to establish whether our measured values track expectation.")
 
     df = load_validation_data()
     if df.is_empty():
@@ -507,6 +510,7 @@ def render_calibration_tab():
 def render_known_group_tab():
     """V4: Known-group validity (discriminant)."""
     st.subheader("V4 Known-Group: Do Chinese/Western models diverge on sensitive topics?")
+    st.caption("Here we check whether our methodology can detect a known cross-model difference. We compare Chinese models (DeepSeek, Kimi) to Western models (Claude, GPT-5-mini) on a set of politically sensitive propositions across which we expect measurable divergence.")
 
     df = load_discriminant_data()
     if df.is_empty():
@@ -646,7 +650,7 @@ def render_inspect_tab():
 
     # Dataset selector
     dataset = st.radio(
-        "Dataset",
+        "",
         ["Clearly False", "Well-Established", "Uncertain", "China Higher", "West Higher"],
         horizontal=True,
         key="inspect_dataset"
