@@ -979,7 +979,6 @@ def render_explorer_tab(df: pl.DataFrame):
 def render_model_agreement_tab(df: pl.DataFrame):
     """Render model agreement heatmap tab."""
     st.subheader("Model Agreement")
-    st.caption("Correlation of credences across shared prompts. Higher = models agree on which propositions deserve high/low credence.")
 
     if df.is_empty():
         st.warning("No data found.")
@@ -1009,8 +1008,9 @@ def render_model_agreement_tab(df: pl.DataFrame):
                 key="agreement_domains",
             )
         with col3:
-            corr_type = st.radio("Correlation", ["Pearson", "Spearman"], horizontal=True, key="agreement_corr_type")
+            metric_type = st.radio("Metric", ["Pearson", "Spearman", "MAE"], horizontal=True, key="agreement_metric_type")
 
+    use_mae = metric_type == "MAE"
     selected_models = [name_to_id[name] for name in selected_model_names if name in name_to_id]
 
     # Apply filters
@@ -1048,53 +1048,56 @@ def render_model_agreement_tab(df: pl.DataFrame):
     model_rank = {m: i for i, m in enumerate(model_order_preference)}
     selected_models_ordered = sorted(selected_models, key=lambda m: model_rank.get(m, 999))
 
-    # Calculate pairwise correlations
+    # Calculate pairwise agreement metrics
     n_models = len(selected_models_ordered)
-    corr_matrix = np.full((n_models, n_models), np.nan)
-
-    corr_func = spearmanr if corr_type == "Spearman" else pearsonr
+    metric_matrix = np.full((n_models, n_models), np.nan)
 
     for i, m1 in enumerate(selected_models_ordered):
         for j, m2 in enumerate(selected_models_ordered):
             if i == j:
-                corr_matrix[i, j] = 1.0
+                metric_matrix[i, j] = 0.0 if use_mae else 1.0
             elif m1 in pivot_wide.columns and m2 in pivot_wide.columns:
                 valid = pivot_wide[[m1, m2]].dropna()
                 if len(valid) >= 10:
-                    r, _ = corr_func(valid[m1].values, valid[m2].values)
-                    corr_matrix[i, j] = r
+                    if use_mae:
+                        mae = np.abs(valid[m1].values - valid[m2].values).mean()
+                        metric_matrix[i, j] = mae
+                    else:
+                        corr_func = spearmanr if metric_type == "Spearman" else pearsonr
+                        r, _ = corr_func(valid[m1].values, valid[m2].values)
+                        metric_matrix[i, j] = r
 
     # Create friendly names for display
     friendly_names = [_friendly_model_name(m) for m in selected_models_ordered]
 
     # Collect unique pairs (i < j only to avoid duplicates)
-    pair_correlations = []
+    pair_metrics = []
     for i in range(n_models):
         for j in range(i + 1, n_models):
-            if not math.isnan(corr_matrix[i, j]):
-                pair_correlations.append({
+            if not math.isnan(metric_matrix[i, j]):
+                pair_metrics.append({
                     "Model 1": friendly_names[i],
                     "Model 2": friendly_names[j],
-                    "r": corr_matrix[i, j],
+                    "value": metric_matrix[i, j],
                 })
 
-    if pair_correlations:
-        # Sort by correlation descending (most similar first)
-        pair_correlations.sort(key=lambda x: x["r"], reverse=True)
+    if pair_metrics:
+        # Sort: for MAE lower=better (ascending), for correlation higher=better (descending)
+        pair_metrics.sort(key=lambda x: x["value"], reverse=not use_mae)
 
         # Auto-scale color range
-        r_values = [p["r"] for p in pair_correlations]
-        z_min = min(r_values) - 0.02
-        z_max = max(r_values) + 0.02
+        values = [p["value"] for p in pair_metrics]
+        z_min = min(values) - 0.02
+        z_max = max(values) + 0.02
     else:
-        z_min, z_max = 0, 1
+        z_min, z_max = (0, 0.5) if use_mae else (0, 1)
 
     # Format text labels
     text_labels = []
     for i in range(n_models):
         text_row = []
         for j in range(n_models):
-            v = corr_matrix[i, j]
+            v = metric_matrix[i, j]
             if math.isnan(v):
                 text_row.append("")
             else:
@@ -1102,18 +1105,23 @@ def render_model_agreement_tab(df: pl.DataFrame):
         text_labels.append(text_row)
 
     # Build heatmap figure
-    fig_corr = go.Figure(data=go.Heatmap(
-        z=corr_matrix,
+    # For MAE: lower=better, so use RdBu (red=high=bad, blue=low=good)
+    # For correlation: higher=better, so use RdBu_r (red=high=good)
+    colorscale = "RdBu" if use_mae else "RdBu_r"
+    colorbar_title = "MAE" if use_mae else "r"
+
+    fig_heatmap = go.Figure(data=go.Heatmap(
+        z=metric_matrix,
         x=friendly_names,
         y=friendly_names,
         text=text_labels,
         texttemplate="%{text}",
-        colorscale="RdBu_r",
+        colorscale=colorscale,
         zmin=z_min,
         zmax=z_max,
-        colorbar=dict(title="r"),
+        colorbar=dict(title=colorbar_title),
     ))
-    fig_corr.update_layout(
+    fig_heatmap.update_layout(
         height=400,
         margin=dict(l=120, r=20, t=20, b=120),
         xaxis=dict(tickangle=45),
@@ -1122,7 +1130,7 @@ def render_model_agreement_tab(df: pl.DataFrame):
     # Build domain strip plot if we have domain data
     fig_strip = None
     if "domain" in filtered_df.columns and selected_domains:
-        domain_corr_points = []
+        domain_points = []
         domain_means = {}
 
         for domain in selected_domains:
@@ -1136,47 +1144,53 @@ def render_model_agreement_tab(df: pl.DataFrame):
 
             domain_pivot = domain_pivot_df.pivot(index="prompt_id", columns="target_model_id", values="consensus_credence")
 
-            domain_corrs = []
+            domain_values = []
             for i, m1 in enumerate(selected_models_ordered):
                 for j, m2 in enumerate(selected_models_ordered):
                     if i < j and m1 in domain_pivot.columns and m2 in domain_pivot.columns:
                         valid = domain_pivot[[m1, m2]].dropna()
                         if len(valid) >= 10:
-                            r, _ = corr_func(valid[m1].values, valid[m2].values)
-                            domain_corrs.append(r)
-                            domain_corr_points.append({
+                            if use_mae:
+                                val = np.abs(valid[m1].values - valid[m2].values).mean()
+                            else:
+                                corr_func = spearmanr if metric_type == "Spearman" else pearsonr
+                                val, _ = corr_func(valid[m1].values, valid[m2].values)
+                            domain_values.append(val)
+                            domain_points.append({
                                 "Domain": domain,
-                                "r": r,
+                                "value": val,
                                 "model1": _friendly_model_name(m1),
                                 "model2": _friendly_model_name(m2),
                             })
 
-            if domain_corrs:
-                domain_means[domain] = sum(domain_corrs) / len(domain_corrs)
+            if domain_values:
+                domain_means[domain] = sum(domain_values) / len(domain_values)
 
-        if domain_corr_points:
-            points_df = pd.DataFrame(domain_corr_points)
-            sorted_domains = sorted(domain_means.keys(), key=lambda d: domain_means[d])
+        if domain_points:
+            points_df = pd.DataFrame(domain_points)
+            # Sort: for MAE lower=better (ascending), for correlation higher=better (descending)
+            sorted_domains = sorted(domain_means.keys(), key=lambda d: domain_means[d], reverse=not use_mae)
 
             fig_strip = go.Figure()
 
+            metric_label = "MAE" if use_mae else "r"
             for domain in sorted_domains:
                 domain_data = points_df[points_df["Domain"] == domain]
-                domain_r = domain_data["r"].values
+                domain_vals = domain_data["value"].values
                 domain_m1 = domain_data["model1"].values
                 domain_m2 = domain_data["model2"].values
-                jitter = np.random.uniform(-0.2, 0.2, len(domain_r))
+                jitter = np.random.uniform(-0.2, 0.2, len(domain_vals))
                 y_positions = [sorted_domains.index(domain) + j for j in jitter]
 
                 fig_strip.add_trace(go.Scatter(
-                    x=domain_r,
+                    x=domain_vals,
                     y=y_positions,
                     mode="markers",
                     marker=dict(size=8, opacity=0.6),
                     name=domain,
                     showlegend=False,
                     customdata=list(zip(domain_m1, domain_m2)),
-                    hovertemplate="%{customdata[0]} & %{customdata[1]}<br>r=%{x:.2f}<extra></extra>",
+                    hovertemplate=f"%{{customdata[0]}} & %{{customdata[1]}}<br>{metric_label}=%{{x:.2f}}<extra></extra>",
                 ))
                 fig_strip.add_trace(go.Scatter(
                     x=[domain_means[domain]],
@@ -1187,10 +1201,12 @@ def render_model_agreement_tab(df: pl.DataFrame):
                     hovertemplate=f"Mean: %{{x:.2f}}<extra></extra>",
                 ))
 
+            x_title = "Mean Absolute Error" if use_mae else "Pairwise Correlation (r)"
+            x_range = [0, max(points_df["value"]) + 0.05] if use_mae else [0, 1]
             fig_strip.update_layout(
                 height=400,
                 margin=dict(l=120, r=20, t=20, b=40),
-                xaxis=dict(title="Pairwise Correlation (r)", range=[0, 1]),
+                xaxis=dict(title=x_title, range=x_range),
                 yaxis=dict(
                     tickmode="array",
                     tickvals=list(range(len(sorted_domains))),
@@ -1200,15 +1216,21 @@ def render_model_agreement_tab(df: pl.DataFrame):
             )
 
     # Display heatmap, then strip plot below
-    st.plotly_chart(fig_corr, use_container_width=True)
+    st.plotly_chart(fig_heatmap, use_container_width=True)
 
-    if pair_correlations:
-        most_similar = pair_correlations[0]
-        least_similar = pair_correlations[-1]
-        st.caption(
-            f"Most similar: **{most_similar['Model 1']}** & **{most_similar['Model 2']}** (r={most_similar['r']:.2f}) | "
-            f"Least similar: **{least_similar['Model 1']}** & **{least_similar['Model 2']}** (r={least_similar['r']:.2f})"
-        )
+    if pair_metrics:
+        most_similar = pair_metrics[0]
+        least_similar = pair_metrics[-1]
+        if use_mae:
+            st.caption(
+                f"Most similar: **{most_similar['Model 1']}** & **{most_similar['Model 2']}** (MAE={most_similar['value']:.2f}) | "
+                f"Least similar: **{least_similar['Model 1']}** & **{least_similar['Model 2']}** (MAE={least_similar['value']:.2f})"
+            )
+        else:
+            st.caption(
+                f"Most similar: **{most_similar['Model 1']}** & **{most_similar['Model 2']}** (r={most_similar['value']:.2f}) | "
+                f"Least similar: **{least_similar['Model 1']}** & **{least_similar['Model 2']}** (r={least_similar['value']:.2f})"
+            )
 
     if fig_strip:
         st.markdown("**Agreement by Domain**")
