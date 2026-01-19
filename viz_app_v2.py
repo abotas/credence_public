@@ -3,21 +3,35 @@
 Usage:
     uv run streamlit run viz_app_v2.py
 
-Part 1: Method Validation (V1-V4)
+Part 1: Method Validation
 - V1 Test-retest reliability
 - V2 Judge agreement
 - V3 Calibration
 - V4 Known-group validity (discriminant)
+- Inspect: proposition inspection
 """
 
+import hashlib
+import json
+import re
 from pathlib import Path
 
-import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 from scipy.stats import pearsonr, spearmanr, wilcoxon
+
+
+def slugify(text: str, max_length: int = 50) -> str:
+    """Convert text to lowercase alphanumeric slug with hash suffix for uniqueness."""
+    text_hash = hashlib.md5(text.encode()).hexdigest()[:8]
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    prefix_max = max_length - len(text_hash) - 1
+    if len(slug) > prefix_max:
+        slug = slug[:prefix_max].rsplit("-", 1)[0]
+    return f"{slug}-{text_hash}"
+
 
 # =============================================================================
 # Constants
@@ -107,6 +121,19 @@ def _add_consensus_credence(df: pl.DataFrame) -> pl.DataFrame:
             (pl.col("judge1_credence") + pl.col("judge2_credence")) / 2
         ).otherwise(None).alias("consensus_credence")
     ])
+
+
+@st.cache_data
+def load_judged_jsonl(data_root: str, subpath: str, slug: str) -> list[dict]:
+    """Load full judged.jsonl for a specific proposition (on-demand)."""
+    path = Path(data_root) / subpath / slug / "judged.jsonl"
+    if not path.exists():
+        return []
+    samples = []
+    with open(path) as f:
+        for line in f:
+            samples.append(json.loads(line))
+    return samples
 
 
 # =============================================================================
@@ -613,6 +640,247 @@ def render_known_group_tab():
     st.checkbox("Exclude propositions with >30% excluded samples", key="v4_exclude")
 
 
+def render_inspect_tab():
+    """V5 Inspect: Deep dive into individual propositions."""
+    st.subheader("Inspect: Examine individual propositions and samples")
+
+    # Dataset selector
+    dataset = st.radio(
+        "Dataset",
+        ["Clearly False", "Well-Established", "Uncertain", "China Higher", "West Higher"],
+        horizontal=True,
+        key="inspect_dataset"
+    )
+
+    # Load appropriate data
+    is_china = dataset in ("China Higher", "West Higher")
+
+    if is_china:
+        df = load_discriminant_data()
+        directions = load_proposition_directions()
+        direction_val = dataset == "China Higher"
+        props_with_dir = [p for p, d in directions.items() if d == direction_val]
+        df = df.filter(pl.col("proposition").is_in(props_with_dir))
+
+        # Model filter
+        all_models = df["target_model_id"].unique().sort().to_list()
+        selected_models = st.multiselect("Filter models", all_models, default=all_models, key="inspect_models")
+        df = df.filter(pl.col("target_model_id").is_in(selected_models))
+
+        data_root = DISCRIMINANT_DATA_ROOT
+    else:
+        df = load_validation_data()
+        category_map = {"Clearly False": "clearly_false", "Well-Established": "well_established", "Uncertain": "contested"}
+        df = df.filter(pl.col("category") == category_map[dataset])
+        data_root = DATA_ROOT
+
+    if df.is_empty():
+        st.warning("No data for selected filters.")
+        return
+
+    # Compute per-proposition stats (sorted by median descending, then by proposition for stability)
+    prop_stats = df.group_by("proposition").agg([
+        pl.col("consensus_credence").drop_nulls().median().alias("median"),
+        pl.len().alias("n_total"),
+        pl.col("consensus_credence").is_null().sum().alias("n_excluded"),
+        (~pl.col("judge1_informative") | ~pl.col("judge2_informative")).sum().alias("n_uninformative"),
+        (pl.col("judge1_refusal") | pl.col("judge2_refusal")).sum().alias("n_refusals"),
+    ]).sort(["median", "proposition"], descending=[True, False])
+
+    props = prop_stats["proposition"].to_list()
+    medians = prop_stats["median"].to_list()
+
+    # Build formatted labels
+    prop_to_label = {}
+    for p, m in zip(props, medians):
+        m_str = f"{m:.2f}" if m is not None else "N/A"
+        p_short = p[:55] + "..." if len(p) > 55 else p
+        prop_to_label[p] = f"{m_str} - {p_short}"
+
+    widget_key = f"v5_prop_{dataset.replace('-', '_').replace(' ', '_')}"
+
+    selected_prop = st.selectbox(
+        "Proposition (by median credence)",
+        props,
+        format_func=lambda p: prop_to_label[p],
+        key=widget_key,
+    )
+
+    # Stats row
+    st.markdown(f"**{selected_prop}**")
+
+    if is_china:
+        # Compute stats separately for Western and Chinese models
+        prop_df_stats = df.filter(pl.col("proposition") == selected_prop)
+        west_df = prop_df_stats.filter(pl.col("model_group") == "western")
+        china_df = prop_df_stats.filter(pl.col("model_group") == "chinese")
+
+        def get_stats(sub_df: pl.DataFrame) -> dict:
+            return {
+                "median": sub_df["consensus_credence"].drop_nulls().median(),
+                "total": len(sub_df),
+                "excluded": sub_df["consensus_credence"].is_null().sum(),
+                "uninformative": (~sub_df["judge1_informative"] | ~sub_df["judge2_informative"]).sum(),
+                "refusals": (sub_df["judge1_refusal"] | sub_df["judge2_refusal"]).sum(),
+            }
+
+        west_stats = get_stats(west_df)
+        china_stats = get_stats(china_df)
+
+        def fmt_split(west_val, china_val, is_float: bool = False) -> str:
+            if is_float:
+                w = f"{west_val:.2f}" if west_val is not None else "N/A"
+                c = f"{china_val:.2f}" if china_val is not None else "N/A"
+            else:
+                w, c = str(west_val), str(china_val)
+            return f'<span style="color:blue">{w}</span> / <span style="color:red">{c}</span>'
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.markdown("**Median**")
+        c1.markdown(fmt_split(west_stats["median"], china_stats["median"], is_float=True), unsafe_allow_html=True)
+        c2.markdown("**Total**")
+        c2.markdown(fmt_split(west_stats["total"], china_stats["total"]), unsafe_allow_html=True)
+        c3.markdown("**Excluded**")
+        c3.markdown(fmt_split(west_stats["excluded"], china_stats["excluded"]), unsafe_allow_html=True)
+        c4.markdown("**Uninformative**")
+        c4.markdown(fmt_split(west_stats["uninformative"], china_stats["uninformative"]), unsafe_allow_html=True)
+        c5.markdown("**Refusals**")
+        c5.markdown(fmt_split(west_stats["refusals"], china_stats["refusals"]), unsafe_allow_html=True)
+    else:
+        row = prop_stats.filter(pl.col("proposition") == selected_prop).row(0, named=True)
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Median", f"{row['median']:.2f}" if row['median'] is not None else "N/A")
+        c2.metric("Total", row['n_total'])
+        c3.metric("Excluded", row['n_excluded'])
+        c4.metric("Uninformative", row['n_uninformative'])
+        c5.metric("Refusals", row['n_refusals'])
+
+    # Distribution histogram with fixed bins: 0-0.05, 0.05-0.1, ..., 0.95-1.0
+    prop_df = df.filter(pl.col("proposition") == selected_prop)
+    if is_china:
+        # Separate histograms for Chinese (red) and Western (blue) models
+        west_credences = prop_df.filter(pl.col("model_group") == "western")["consensus_credence"].drop_nulls().to_list()
+        china_credences = prop_df.filter(pl.col("model_group") == "chinese")["consensus_credence"].drop_nulls().to_list()
+        if west_credences or china_credences:
+            fig = go.Figure()
+            if west_credences:
+                fig.add_trace(go.Histogram(
+                    x=west_credences,
+                    xbins=dict(start=0, end=1, size=0.05),
+                    name="Western",
+                    marker_color="blue",
+                    opacity=0.6,
+                ))
+            if china_credences:
+                fig.add_trace(go.Histogram(
+                    x=china_credences,
+                    xbins=dict(start=0, end=1, size=0.05),
+                    name="Chinese",
+                    marker_color="red",
+                    opacity=0.6,
+                ))
+            fig.update_layout(
+                height=150,
+                margin=dict(l=0, r=0, t=10, b=30),
+                xaxis=dict(range=[0, 1], title="Credence"),
+                yaxis=dict(title=None),
+                barmode="overlay",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    else:
+        prop_credences = prop_df["consensus_credence"].drop_nulls().to_list()
+        if prop_credences:
+            fig = go.Figure(go.Histogram(
+                x=prop_credences,
+                xbins=dict(start=0, end=1, size=0.05),
+            ))
+            fig.update_layout(
+                height=120,
+                margin=dict(l=0, r=0, t=10, b=30),
+                xaxis=dict(range=[0, 1], title="Credence"),
+                yaxis=dict(title=None),
+                bargap=0.1,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # Load JSONL samples
+    slug = slugify(selected_prop)
+    if is_china:
+        all_samples = []
+        for model in selected_models:
+            model_slug = model.replace("/", "_")
+            samples = load_judged_jsonl(str(data_root), model_slug, slug)
+            all_samples.extend(samples)
+    else:
+        all_samples = load_judged_jsonl(str(data_root), "run_0", slug)
+
+    # Sort samples: consensus first (descending), then non-consensus
+    def sample_sort_key(s: dict) -> tuple:
+        cc = s.get("consensus_credence")
+        if cc is not None:
+            return (0, -cc)
+        return (1, 0)
+
+    all_samples_sorted = sorted(all_samples, key=sample_sort_key)
+
+    st.markdown(f"**Samples** ({len(all_samples_sorted)} total)")
+
+    for s in all_samples_sorted:
+        cc = s.get("consensus_credence")
+        is_consensus = cc is not None
+        model_name = s.get("test_llm_id", "unknown").split("/")[-1]
+        prompt_preview = s.get("text", "")[:80].replace("\n", " ")
+        if len(s.get("text", "")) > 80:
+            prompt_preview += "..."
+
+        j1_inf = s.get("judge1_informative", True)
+        j2_inf = s.get("judge2_informative", True)
+        j1_c = s.get("judge1_credence")
+        j2_c = s.get("judge2_credence")
+        j1_ref = s.get("judge1_refusal", False)
+        j2_ref = s.get("judge2_refusal", False)
+
+        def judge_str(credence, informative: bool, refusal: bool) -> str:
+            if informative and credence is not None:
+                return f"{credence:.2f}"
+            if refusal:
+                return "Refusal"
+            return "non-inf"
+
+        header = f"**{model_name}** | "
+        if is_consensus:
+            header += f"{cc:.2f}"
+        else:
+            header += "No consensus ("
+            header += f"J1={judge_str(j1_c, j1_inf, j1_ref)}, J2={judge_str(j2_c, j2_inf, j2_ref)})"
+        header += f" | {prompt_preview}"
+
+        with st.expander(header, expanded=False):
+            st.markdown("**Prompt:**")
+            st.code(s.get("text", "")[:1000], language=None)
+
+            st.markdown("**Response:**")
+            st.code(s.get("response_text", "")[:1500], language=None)
+
+            j1_name = s.get("judge1_llm_id", "Judge 1").split("/")[-1]
+            j2_name = s.get("judge2_llm_id", "Judge 2").split("/")[-1]
+
+            j1_label = f"{j1_c:.2f}" if j1_c is not None else "N/A"
+            if not j1_inf:
+                j1_label += " (Refusal)" if j1_ref else " (non-informative)"
+            st.markdown(f"**{j1_name}**: {j1_label}")
+            st.text(s.get("judge1_explanation", "")[:500])
+
+            j2_label = f"{j2_c:.2f}" if j2_c is not None else "N/A"
+            if not j2_inf:
+                j2_label += " (Refusal)" if j2_ref else " (non-informative)"
+            st.markdown(f"**{j2_name}**: {j2_label}")
+            st.text(s.get("judge2_explanation", "")[:500])
+
+
 # =============================================================================
 # Main
 # =============================================================================
@@ -621,11 +889,12 @@ def main():
     st.set_page_config(page_title="Method Validation", layout="wide")
     st.title("Part 1: Method Validation")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "V1 Test-Retest",
         "V2 Judge Agreement",
         "V3 Calibration",
         "V4 Known-Group",
+        "Inspect",
     ])
 
     with tab1:
@@ -639,6 +908,9 @@ def main():
 
     with tab4:
         render_known_group_tab()
+
+    with tab5:
+        render_inspect_tab()
 
 
 if __name__ == "__main__":
