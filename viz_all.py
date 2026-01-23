@@ -2674,10 +2674,10 @@ def render_overview_page():
     st.markdown("""
     We generated several sets of 100 propositions across a range of topics. (Full results will include 1000 propositions across 10 topics). These were used as input into a pipeline:
 
-    1. **Prompt generation**: Elicitor models are provided a proposition P and asked to generate 32 prompts representing a diverse set of ways to ask about P, with varying attributes (e.g. whether the prompt suggests the user believes that P).
+    1. **Prompt generation**: Elicitor models are provided a proposition *P* and asked to generate 32 prompts representing a diverse set of ways to ask about *P*, with varying attributes (e.g. whether the prompt suggests the user believes that *P*).
     2. **Prompt attribute scoring**: We use judge models to score each prompt for attributes like clarity, emotionality, and implied user belief.
-    3. **Test model response**: The target model receives each of the prompts asking about P, and provides a response in natural language.
-    4. **Credence judging**: Two judge models read the outputs and estimate a probabilistic credence in P between 0 and 1 expressed by the response. If the judges disagree by more than .2 we jettison the response, and otherwise take the mean.
+    3. **Test model response**: The target model receives each of the prompts asking about *P*, and provides a response in natural language.
+    4. **Credence judging**: Two judge models read the outputs and estimate a probabilistic credence in *P* between 0 and 1 expressed by the response. If the judges disagree by more than .2 we jettison the response, and otherwise take the mean.
 
     **Study**: We use the extracted credences to check for correlations between attributes and expressed credences (e.g. to test for sensitivity to framing).
     """)
