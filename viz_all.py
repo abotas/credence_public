@@ -2659,25 +2659,27 @@ def render_overview_page():
     st.title("Surveying AI Belief")
 
     st.markdown("""
-    What do AI models actually believe? We built an automated pipeline to measure AI-expressed
-    beliefs towards arbitrary propositions. 
-    We surveyed frontier models 500 propositions across a range of domains to produce initial results:
-    1) validating that our pipeline produces stable results that track reality.
-    2) exploring initial results characterizing model beliefs, sensitivity to prompt framings, and cross-model differences.
+    What do AI models believe? We built an automated pipeline to extract probabilistic beliefs about arbitrary propositions from natural language outputs responding to prompts inquiring about those propositions. The purpose of this is to supply a scalable and automatic way to assess and make transparent what beliefs models express across a range of topics, and to test how that depends on factors like the framing of the user-prompt and the nature of the topic.
+
+    On this provisional page, we demonstrate our initial results. We surveyed frontier models on 500 propositions across a range of domains to produce initial results. These results can be seen here in two main parts.
+
+    **Part 1:** Results controlling the validity of our method with a series of robustness checks specified in the tabs.
+
+    **Part 2:** Substantive results showing expressed model credences across topics, how sensitive they are to framing effects (e.g. perceived user-belief about the topic), and differences between models.
+
+    We have preregistered our study, and the preregistration can be found [here](https://drive.google.com/file/d/1Z_mQGgAeWqXK-sdQANgboEe4PIJh3yWG/view?usp=sharing). A more detailed design spec on our method can be found [here](https://drive.google.com/file/d/1yJLkFneyA0dqSksHP8ij0grsQpXplbTh/view?usp=sharing).
     """)
 
     st.subheader("Method")
     st.markdown("""
-    Each proposition is run through our 4 step pipeline:
+    We generated several sets of 100 propositions across a range of topics. (Full results will include 1000 propositions across 10 topics). These were used as input into a pipeline:
 
-    1. **Prompt generation**: Elicitor models generate varied prompts about the proposition.
-       Prompts are designed to be credence-sensitive, so a model's response reveals its stance; realistic,
-       so a user would plausibly ask them; and diverse across a range of dimensions.
-    2. **Prompt attribute scoring**: We score each prompt for attributes like clarity, emotionality,
-       and implied user valence - whether the user seems to believe or doubt the proposition.
-    3. **Test model response**: The model under test responds to each prompt.
-    4. **Credence judging**: Two judge models independently estimate the implied credence from
-       each response on a 0-1 scale. We use consensus scores where judges agree.
+    1. **Prompt generation**: Elicitor models are provided a proposition P and asked to generate 32 prompts representing a diverse set of ways to ask about P, with varying attributes (e.g. whether the prompt suggests the user believes that P).
+    2. **Prompt attribute scoring**: We use judge models to score each prompt for attributes like clarity, emotionality, and implied user belief.
+    3. **Test model response**: The target model receives each of the prompts asking about P, and provides a response in natural language.
+    4. **Credence judging**: Two judge models read the outputs and estimate a probabilistic credence in P between 0 and 1 expressed by the response. If the judges disagree by more than .2 we jettison the response, and otherwise take the mean.
+
+    **Study**: We use the extracted credences to check for correlations between attributes and expressed credences (e.g. to test for sensitivity to framing).
     """)
 
     st.divider()
@@ -2695,7 +2697,7 @@ def render_overview_page():
 | {_nav_link("V1 Test-Retest", "validation", "test_retest")} | Do repeated end-to-end runs of our pipeline (with different prompts, responses, and judgments) yield stable credences? |
 | {_nav_link("V2 Judge Agreement", "validation", "judge_agreement")} | Do our AI judges generally score prompt-response interactions similarly for credences? |
 | {_nav_link("V3 Calibration", "validation", "calibration")} | Do known-true propositions score high, known-false score low, and uncertain propositions land in between? |
-| {_nav_link("V4 Known-Group", "validation", "known_group")} | Do Chinese vs Western models diverge in expected directions on sensitive topics that are known to be manipulated? |
+| {_nav_link("V4 Known-Group", "validation", "known_group")} | Do Chinese vs Western models diverge in expected directions on sensitive topics on which they are known to differ? |
         """)
 
     with col2:
