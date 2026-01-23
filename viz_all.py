@@ -18,6 +18,7 @@ Part 2: Exploration
 - Prompt Attributes
 """
 
+import gzip
 import hashlib
 import json
 import math
@@ -309,7 +310,7 @@ def add_computed_columns(_df: pl.DataFrame) -> pl.DataFrame:
 # =============================================================================
 
 
-EXPLORATION_DATA_ROOT = Path(__file__).parent / "exploration" / "data"
+EXPLORATION_DATA_ROOT = Path(__file__).parent / "data_exploration"
 
 
 def _load_exploration_samples(proposition: str) -> list[dict]:
@@ -320,9 +321,10 @@ def _load_exploration_samples(proposition: str) -> list[dict]:
     for model_dir in EXPLORATION_DATA_ROOT.iterdir():
         if not model_dir.is_dir() or model_dir.name in ("prompts", "config.json"):
             continue
-        jsonl_path = model_dir / slug / "judged.jsonl"
+        # Look for gzipped jsonl files
+        jsonl_path = model_dir / slug / "judged.jsonl.gz"
         if jsonl_path.exists():
-            with open(jsonl_path) as f:
+            with gzip.open(jsonl_path, "rt") as f:
                 for line in f:
                     all_samples.append(json.loads(line))
 
