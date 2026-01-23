@@ -158,12 +158,12 @@ def _add_consensus_credence(df: pl.DataFrame) -> pl.DataFrame:
 
 @st.cache_data
 def load_judged_jsonl(data_root: str, subpath: str, slug: str) -> list[dict]:
-    """Load full judged.jsonl for a specific proposition (on-demand)."""
-    path = Path(data_root) / subpath / slug / "judged.jsonl"
+    """Load full judged.jsonl.gz for a specific proposition (on-demand)."""
+    path = Path(data_root) / subpath / slug / "judged.jsonl.gz"
     if not path.exists():
         return []
     samples = []
-    with open(path) as f:
+    with gzip.open(path, "rt") as f:
         for line in f:
             samples.append(json.loads(line))
     return samples
