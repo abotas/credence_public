@@ -2684,7 +2684,7 @@ def render_overview_page():
 
     st.divider()
 
-    st.subheader("What's in This App")
+    st.subheader("What's in this app")
 
     col1, col2 = st.columns(2)
 
